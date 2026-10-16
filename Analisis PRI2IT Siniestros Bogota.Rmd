@@ -1,0 +1,754 @@
+---
+title: "¿Qué tan letales son los siniestros viales en Usme? Un modelo bayesiano Beta–Binomial"
+subtitle: "Proyecto Integrador 2 · Estadística Bayesiana · Siniestros viales de Bogotá D.C. 2015–2020"
+author: "Maria Paula Bonilla Martinez · Juan Sebastián Guayazán Clavijo"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 4.8, dpi = 110)
+options(OutDec = ",")   # coma decimal en todo el informe
+```
+
+# Librerías y funciones auxiliares
+
+```{r librerias}
+# Solo la primera vez:
+# install.packages(c("readxl", "dplyr", "tidyr", "ggplot2", "rjags", "coda"))
+# Además hay que instalar JAGS: https://mcmc-jags.sourceforge.io
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(rjags)      # interfaz a JAGS (hay que tener JAGS instalado)
+library(coda)       # diagnósticos de convergencia
+theme_set(theme_minimal(base_size = 11))
+set.seed(2026)
+
+pct <- function(x, d = 2) paste0(format(round(100 * x, d), nsmall = d, decimal.mark = ","), " %")
+num <- function(x, d = 3) format(round(x, d), nsmall = d, decimal.mark = ",", big.mark = ".")
+
+# log de la distribución marginal Beta-Binomial: log m(x) = log C(n,x) + log B(x+a, n-x+b) - log B(a,b)
+lbb <- function(x, n, a, b) lchoose(n, x) + lbeta(x + a, n - x + b) - lbeta(a, b)
+
+# Intervalo HPD de una Beta (unimodal si a, b > 1; si no, cae a colas iguales)
+hpd_beta <- function(a, b, level = 0.95) {
+  if (a <= 1 || b <= 1) return(qbeta(c((1 - level) / 2, 1 - (1 - level) / 2), a, b))
+  f <- function(p) qbeta(p + level, a, b) - qbeta(p, a, b)
+  p <- optimize(f, c(0, 1 - level))$minimum
+  qbeta(c(p, p + level), a, b)
+}
+
+# Prueba de rachas de Wald-Wolfowitz para una secuencia 0/1
+runs_test <- function(y) {
+  n1 <- sum(y == 1); n0 <- sum(y == 0); n <- n1 + n0
+  R   <- 1 + sum(diff(y) != 0)
+  mu  <- 2 * n1 * n0 / n + 1
+  v   <- 2 * n1 * n0 * (2 * n1 * n0 - n) / (n^2 * (n - 1))
+  z   <- (R - mu) / sqrt(v)
+  list(R = R, esperadas = mu, z = z, p = 2 * pnorm(-abs(z)))
+}
+
+# Conteos de éxitos en bloques de m ensayos consecutivos (se descarta el resto)
+bloques <- function(y, m) {
+  k <- length(y) %/% m
+  colSums(matrix(y[seq_len(k * m)], nrow = m))
+}
+
+# Bondad de ajuste a una Binomial(m, p_hat); las colas se agrupan hasta esperado >= 5
+gof_binom <- function(cnt, m) {
+  k <- length(cnt); p <- sum(cnt) / (k * m)
+  obs <- tabulate(cnt + 1, m + 1); ex <- k * dbinom(0:m, m, p)
+  while (length(ex) > 2 && ex[1] < 5) {
+    ex <- c(ex[1] + ex[2], ex[-(1:2)]); obs <- c(obs[1] + obs[2], obs[-(1:2)])
+  }
+  while (length(ex) > 2 && ex[length(ex)] < 5) {
+    L <- length(ex)
+    ex <- c(ex[1:(L - 2)], ex[L - 1] + ex[L]); obs <- c(obs[1:(L - 2)], obs[L - 1] + obs[L])
+  }
+  chi <- sum((obs - ex)^2 / ex); df <- length(ex) - 2
+  list(tabla = tibble(celda = seq_along(ex), observado = obs, esperado = round(ex, 1)),
+       chi2 = chi, gl = df, p = pchisq(chi, df, lower.tail = FALSE))
+}
+
+# Razón de dispersión: Var(conteos) / (m p (1-p)); prueba chi-cuadrado de dispersión (dos colas)
+dispersion <- function(cnt, m) {
+  k <- length(cnt); p <- sum(cnt) / (k * m)
+  D <- sum((cnt - m * p)^2) / (m * p * (1 - p))
+  list(razon = var(cnt) / (m * p * (1 - p)), D = D, gl = k - 1,
+       p = 2 * min(pchisq(D, k - 1), pchisq(D, k - 1, lower.tail = FALSE)))
+}
+```
+
+# Datos
+
+El archivo es el conjunto abierto *Siniestros Viales Consolidados Bogotá D.C.* de la Secretaría Distrital de Movilidad (licencia CC BY 4.0). Si ya corriste `scripts/01_eda.R`, se carga la versión limpia; si no, se importa el xlsx (tarda unos minutos).
+
+```{r datos}
+f_rds  <- "data/processed/siniestros_limpio.rds"
+f_xlsx <- "data/raw/siniestros_viales_consolidados_bogota_dc.xlsx"
+
+if (file.exists(f_rds)) {
+  s <- readRDS(f_rds)
+} else {
+  s   <- read_excel(f_xlsx, sheet = "SINIESTROS", guess_max = 20000)
+  dic <- read_excel(f_xlsx, sheet = "DICCIONARIO")
+  loc <- dic %>% filter(CAMPO == "CODIGO_LOCALIDAD") %>%
+    transmute(CODIGO_LOCALIDAD = as.numeric(CODIGO), localidad = DESCRIPCION)
+  s <- s %>%
+    mutate(FECHA = as.Date(FECHA, format = "%d/%m/%Y"),
+           anio  = as.integer(format(FECHA, "%Y")),
+           fatal = as.integer(GRAVEDAD == 1)) %>%
+    left_join(loc, by = "CODIGO_LOCALIDAD")
+}
+# Orden cronológico (necesario para la prueba de rachas)
+s <- s %>% arrange(FECHA, HORA, CODIGO_ACCIDENTE)
+c(filas = nrow(s), desde = format(min(s$FECHA)), hasta = format(max(s$FECHA)))
+```
+
+## Depuración: tres decisiones
+
+1. **Evento de estudio.** Cada siniestro es un ensayo: *éxito* = el siniestro tiene al menos un muerto (`GRAVEDAD == 1`, «Con muertos»); *fracaso* = solo heridos o solo daños. El parámetro es $p$ = **proporción de siniestros que son fatales** (letalidad). **No es una tasa por habitante**: el dataset no trae población ni exposición.
+2. **Periodo.** Aunque el portal indica «desde 2015» y fecha del dato 2021, el archivo termina el 31-dic-2020. Se usan **2015–2019 como información previa** y **2020 como datos nuevos**. 2020 es además el año de la cuarentena (ver abajo), así que el periodo previo y el nuevo no son del todo comparables.
+3. **Localidad de estudio: Usme.** Es una de las localidades con mayor proporción fatal y tiene un tamaño muestral intermedio, donde el prior pesa lo suficiente como para ser interesante.
+
+```{r calidad}
+tibble(
+  indicador = c("Siniestros", "IDs duplicados", "NA en gravedad", "NA en localidad", "NA en fecha"),
+  valor = c(nrow(s), sum(duplicated(s$CODIGO_ACCIDENTE)), sum(is.na(s$GRAVEDAD)),
+            sum(is.na(s$CODIGO_LOCALIDAD)), sum(is.na(s$FECHA))))
+```
+
+# Análisis exploratorio
+
+```{r eda-gravedad}
+s %>% count(GRAVEDAD) %>%
+  mutate(categoria = c("Con muertos", "Con heridos", "Solo daños")[GRAVEDAD], prop = pct(n / sum(n))) %>%
+  select(categoria, n, prop)
+```
+
+```{r eda-anual}
+anual <- s %>% group_by(anio) %>% summarise(n = n(), fatales = sum(fatal), prop_fatal = fatales / n)
+anual %>% mutate(prop_fatal = pct(prop_fatal))
+```
+
+```{r eda-mensual, fig.height=4}
+mensual <- s %>% mutate(mes = as.Date(format(FECHA, "%Y-%m-01"))) %>% count(mes)
+ggplot(mensual, aes(mes, n)) + geom_line(colour = "#2c7fb8") +
+  geom_vline(xintercept = as.Date("2020-03-25"), linetype = 2, colour = "firebrick") +
+  annotate("text", x = as.Date("2020-03-25"), y = max(mensual$n), label = " Cuarentena", hjust = 0, colour = "firebrick") +
+  labs(x = NULL, y = "Siniestros por mes", title = "Siniestros mensuales: la cuarentena de 2020 reduce el flujo ~35 %")
+```
+
+En 2020 hay mucho menos siniestros, pero **la proporción fatal casi no cambia** (`r pct(anual$prop_fatal[anual$anio == 2020])` en 2020 frente a `r pct(mean(s$fatal[s$anio <= 2019]))` en 2015–2019). Es lo que hace interesante estudiar 2020: la exposición cambió, la letalidad no tanto.
+
+```{r eda-localidad, fig.height=6.5}
+loc_tab <- s %>% group_by(localidad) %>% summarise(n = n(), fatales = sum(fatal), .groups = "drop") %>%
+  mutate(prop = fatales / n,
+         lo = mapply(function(x, n) binom.test(x, n)$conf.int[1], fatales, n),
+         hi = mapply(function(x, n) binom.test(x, n)$conf.int[2], fatales, n))
+p_bog_total <- mean(s$fatal)
+ggplot(loc_tab %>% filter(localidad != "Sumapaz"), aes(reorder(localidad, prop), prop, ymin = lo, ymax = hi, colour = localidad == "Usme")) +
+  geom_pointrange(show.legend = FALSE) + geom_hline(yintercept = p_bog_total, linetype = 2) +
+  scale_colour_manual(values = c("grey40", "firebrick")) + coord_flip() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = NULL, y = "Proporción de siniestros fatales (IC 95 % exacto)",
+       title = "Proporción fatal por localidad, 2015–2020", subtitle = "Línea punteada: Bogotá. Usme en rojo. (Sumapaz, con 7 siniestros, no se muestra)")
+```
+
+# Datos del modelo
+
+```{r datos-modelo}
+bog_prev <- s %>% filter(anio <= 2019)
+x_b <- sum(bog_prev$fatal); n_b <- nrow(bog_prev); p_b <- x_b / n_b          # Bogotá 2015-19
+usme    <- s %>% filter(localidad == "Usme")
+u_prev  <- usme %>% filter(anio <= 2019); x_u0 <- sum(u_prev$fatal); n_u0 <- nrow(u_prev)
+x <- sum(usme$fatal[usme$anio == 2020]); n <- sum(usme$anio == 2020)         # Usme 2020 (verosimilitud)
+p0 <- mean(s$fatal[s$anio == 2020])                                          # Bogotá 2020 (referencia del contraste)
+
+tibble(conjunto = c("Bogotá 2015–2019 (prior)", "Usme 2015–2019", "Usme 2020 (datos)", "Bogotá 2020 (referencia p0)"),
+       siniestros = c(n_b, n_u0, n, sum(s$anio == 2020)),
+       fatales    = c(x_b, x_u0, x, sum(s$fatal[s$anio == 2020])),
+       proporcion = pct(c(p_b, x_u0 / n_u0, x / n, p0), 3))
+```
+
+El modelo es
+
+$$X \mid p \sim \text{Binomial}(n, p), \qquad p \sim \text{Beta}(\alpha, \beta) \quad\Longrightarrow\quad p \mid X \sim \text{Beta}(\alpha + x,\ \beta + n - x),$$
+
+con $x = `r x`$ siniestros fatales entre $n = `r n`$ siniestros de Usme en 2020.
+
+# ¿El evento es binomial? Pruebas de supuestos
+
+Un conteo de fatales es binomial si (i) cada siniestro tiene dos resultados, (ii) los siniestros son independientes y (iii) $p$ es constante. Se verifican con datos **2015–2019** (el periodo del prior), usando la secuencia cronológica de siniestros. En todas las pruebas $H_0$ = «el supuesto se cumple»; un p-valor grande indica compatibilidad, no prueba.
+
+## Independencia: prueba de rachas
+
+```{r rachas}
+rach <- bind_rows(
+  Bogota = unlist(runs_test(bog_prev$fatal)),
+  Usme   = unlist(runs_test(u_prev$fatal)), .id = "serie")
+rach %>% mutate(across(-serie, ~ round(.x, 3)))
+```
+
+Con proporciones fatales de ~1,5 %, la secuencia 0/1 está casi toda en ceros, así que esta prueba tiene **poca potencia** (sobre todo en Usme, con ~110 fatales). Se reporta, pero no debe leerse como garantía de independencia. Una dependencia más plausible es **espacial/temporal** (zonas y horas peligrosas), que se discute en las limitaciones.
+
+## Probabilidad constante: homogeneidad entre años
+
+```{r homog}
+homog <- function(d) { t <- chisq.test(table(d$anio, d$fatal)); c(chi2 = unname(t$statistic), gl = unname(t$parameter), p = t$p.value) }
+rbind(
+  "Bogotá 2015–2019" = homog(bog_prev),
+  "Bogotá 2015–2020" = homog(s),
+  "Usme 2015–2019"   = homog(u_prev),
+  "Usme 2015–2020"   = homog(usme)) %>% round(4)
+```
+
+## Forma binomial y dispersión: bloques de 100 siniestros consecutivos
+
+Si cada siniestro es un ensayo con la misma $p$, los conteos de fatales en bloques de $m = 100$ siniestros consecutivos deben seguir una Binomial($100, \hat p$) y su varianza debe ser $m\hat p(1-\hat p)$. Se aplica a Bogotá (1.734 bloques) y, solo para dispersión, a Usme (34 bloques).
+
+```{r bloques}
+m <- 100
+cb <- bloques(bog_prev$fatal, m); cu <- bloques(u_prev$fatal, m)
+g  <- gof_binom(cb, m)
+g$tabla
+c(chi2 = g$chi2, gl = g$gl, p = g$p)
+```
+
+```{r dispersion}
+dB <- dispersion(cb, m); dU <- dispersion(cu, m)
+tibble(serie = c("Bogotá 2015–19", "Usme 2015–19"), bloques = c(length(cb), length(cu)),
+       razon_varianzas = c(dB$razon, dU$razon), p_dispersion = c(dB$p, dU$p)) %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+```{r resumen-supuestos}
+supuestos <- tibble(
+  supuesto = c("Independencia (rachas)", "p constante entre años (Bogotá 15–19)", "p constante entre años (Usme 15–19)",
+               "Forma binomial en bloques (Bogotá)", "Sin sobredispersión (Bogotá)", "Sin sobredispersión (Usme)"),
+  p_valor = c(rach$p[1], homog(bog_prev)["p"], homog(u_prev)["p"], g$p, dB$p, dU$p)) %>%
+  mutate(p_valor = round(p_valor, 4), `¿se rechaza al 5 %?` = ifelse(p_valor < 0.05, "sí", "no"))
+supuestos
+```
+
+**Lectura.**
+
+- **Se cumplen** (no se rechazan): independencia por rachas, forma binomial en bloques y ausencia de sobredispersión, tanto en Bogotá como en Usme.
+- **Se rechaza** la constancia de $p$ entre años **en Bogotá** (`r num(homog(bog_prev)["p"], 4)`): la proporción fatal pasó de 1,69 % (2015) a 1,35 % (2018), una diferencia pequeña en magnitud pero detectable con 173.000 siniestros. En **Usme** no se rechaza (`r num(homog(u_prev)["p"], 2)`), aunque con ~110 fatales la prueba tiene poca potencia para detectar cambios de ese tamaño.
+- **Consecuencia.** Tratar 2015–2019 como una sola $p$ es una simplificación. Para el prior de Bogotá el efecto es pequeño (el centro se mueve unas décimas de punto porcentual), y por eso el peso del prior se calibra con la dispersión *entre localidades*, que es mucho mayor que la dispersión *entre años*. Es una limitación a declarar, no un error del método.
+
+# Prior: cómo se construye
+
+## La prior «ingenua» pesa demasiado
+
+La conjugada más directa con la información histórica es $\text{Beta}(1 + x_b,\ 1 + n_b - x_b)$ con los `r num(n_b, 0)` siniestros de Bogotá 2015–2019. Eso equivale a decir que **ya vimos `r num(n_b, 0)` siniestros de Usme** con la proporción de Bogotá: los 597 datos de 2020 no pueden mover nada. Además supone que todas las localidades tienen la misma $p$, y los datos muestran que no es así.
+
+## Prior calibrada con la dispersión entre localidades
+
+Se toma como centro la proporción de Bogotá ($\bar p$ = `r pct(p_b, 3)`) y se estima el **peso** $m = \alpha + \beta$ (cuántos «siniestros imaginarios» vale la prior) a partir de cuánto varían las localidades entre sí en 2015–2019, por máxima verosimilitud marginal Beta–Binomial (Sumapaz se excluye por tener 5 siniestros):
+
+$$\alpha = \bar p\, m,\qquad \beta = (1-\bar p)\, m .$$
+
+```{r prior-calibrada}
+loc19 <- bog_prev %>% filter(localidad != "Sumapaz") %>% group_by(localidad) %>% summarise(n = n(), x = sum(fatal), .groups = "drop")
+nll   <- function(logm) -sum(lbb(loc19$x, loc19$n, p_b * exp(logm), (1 - p_b) * exp(logm)))
+m_hat <- exp(optimize(nll, c(log(5), log(1e6)))$minimum)
+
+priors <- tibble(
+  prior = c("Calibrada (entre localidades)", "Bogotá 2015–19 completa", "Jeffreys Beta(0,5; 0,5)", "Uniforme Beta(1; 1)"),
+  a = c(p_b * m_hat, 1 + x_b, 0.5, 1),
+  b = c((1 - p_b) * m_hat, 1 + n_b - x_b, 0.5, 1)) %>%
+  mutate(media = a / (a + b), peso_siniestros_imaginarios = a + b, x_imag = a, n_imag = a + b)
+priors %>% transmute(prior, alfa = round(a, 2), beta = round(b, 2), media_prior = pct(media, 3), `pesa como (siniestros)` = round(peso_siniestros_imaginarios))
+```
+
+**Cómo leerlo.** La prior calibrada pesa como **`r round(m_hat)` siniestros** (frente a los `r n` reales de Usme 2020): es informativa pero no aplastante. Su media es `r pct(p_b, 2)`. Las otras tres cubren el espectro: la completa de Bogotá (prior dogmática), Jeffreys y la uniforme (ignorancia).
+
+**Una elección que conviene tener presente.** Esta prior usa a Bogotá como conocimiento previo e **ignora la historia propia de Usme** (que en 2015–2019 ya tenía `r pct(x_u0 / n_u0, 2)`). Es una elección deliberada (se pregunta «¿se parece Usme a la ciudad?»), pero es *conservadora*: jala la estimación de Usme hacia el promedio de Bogotá.
+
+# Modelo: posterior de la proporción fatal en Usme
+
+```{r posterior}
+resumen <- function(a, b, p0, rope = 0.0025) {
+  A <- a + x; B <- b + n - x; h <- hpd_beta(A, B)
+  logBF01 <- dbinom(x, n, p0, log = TRUE) - lbb(x, n, a, b)   # H0: p = p0  vs  H1: p ~ Beta(a, b)
+  tibble(alfa_post = A, beta_post = B, media = A / (A + B), mediana = qbeta(.5, A, B),
+         hpd_lo = h[1], hpd_hi = h[2],
+         P_mayor_p0 = 1 - pbeta(p0, A, B),
+         P_rope = pbeta(p0 + rope, A, B) - pbeta(p0 - rope, A, B),
+         BF01 = exp(logBF01), P_H0 = 1 / (1 + exp(-logBF01)))
+}
+tab <- bind_rows(lapply(seq_len(nrow(priors)), function(i) cbind(prior = priors$prior[i], resumen(priors$a[i], priors$b[i], p0))))
+tab %>% mutate(across(c(media, mediana, hpd_lo, hpd_hi), ~ round(.x, 4)), across(c(alfa_post, beta_post), ~ round(.x, 1)),
+               P_mayor_p0 = round(P_mayor_p0, 4), P_rope = round(P_rope, 4), BF01 = round(BF01, 3), P_H0 = round(P_H0, 3))
+```
+
+```{r graf-prior-post}
+grid <- seq(0, 0.06, length.out = 800)
+dens <- bind_rows(lapply(seq_len(nrow(priors)), function(k) {
+  bind_rows(tibble(p = grid, d = dbeta(grid, priors$a[k], priors$b[k]), tipo = "Prior", prior = priors$prior[k]),
+            tibble(p = grid, d = dbeta(grid, priors$a[k] + x, priors$b[k] + n - x), tipo = "Posterior", prior = priors$prior[k]))
+})) %>% mutate(prior = factor(prior, priors$prior), tipo = factor(tipo, c("Prior", "Posterior")))
+ggplot(dens, aes(p, d, colour = tipo, linetype = tipo)) + geom_line(linewidth = .8) +
+  geom_vline(xintercept = p0, colour = "grey30", linetype = 3) + geom_vline(xintercept = x / n, colour = "firebrick", linetype = 2) +
+  facet_wrap(~prior, scales = "free_y") + scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Proporción fatal p", y = "Densidad", colour = NULL, linetype = NULL,
+       title = "Usme: prior y posterior según la prior elegida",
+       subtitle = "Punteada gris: Bogotá 2020 (p0). Roja: proporción observada en Usme 2020")
+```
+
+## Resultados con la prior calibrada
+
+```{r resultados-calibrada}
+r1 <- tab[1, ]
+```
+
+- **Estimación puntual (media posterior):** `r pct(r1$media, 2)`; mediana `r pct(r1$mediana, 2)`.
+- **Intervalo HPD 95 %:** [`r pct(r1$hpd_lo, 2)`; `r pct(r1$hpd_hi, 2)`].
+- **Referencia:** la proporción fatal de Bogotá en 2020 es $p_0$ = `r pct(p0, 2)`.
+- **Probabilidad posterior de que Usme supere a Bogotá:** $P(p > p_0 \mid \text{datos})$ = `r num(r1$P_mayor_p0, 3)`.
+- **ROPE** ($p_0 \pm 0{,}25$ pp, supuesto de «diferencia práctica nula»): `r pct(r1$P_rope, 1)` de la posterior cae dentro.
+
+## Sobre la «prueba de hipótesis» $H_0: p = p_0$
+
+Con una prior continua, $P(p = p_0 \mid \text{datos}) = 0$ siempre; la hipótesis puntual no se puede contrastar así. Se usan tres criterios bayesianos y se reportan juntos:
+
+1. **$P(p > p_0 \mid \text{datos})$**: la probabilidad de que Usme sea realmente más letal que Bogotá.
+2. **ROPE**: la masa posterior dentro de una región de equivalencia práctica alrededor de $p_0$.
+3. **Factor de Bayes** de $H_0: p = p_0$ frente a $H_1: p \sim \text{Beta}(\alpha,\beta)$:
+$$BF_{01} = \frac{\text{Bin}(x \mid n, p_0)}{\int \text{Bin}(x \mid n, p)\,\text{Beta}(p \mid \alpha,\beta)\,dp} = \frac{\binom{n}{x}p_0^x(1-p_0)^{n-x}}{\binom{n}{x}\,B(\alpha+x,\ \beta+n-x)/B(\alpha,\beta)} ,$$
+y, con probabilidades previas iguales, $P(H_0\mid\text{datos}) = BF_{01}/(1+BF_{01})$.
+
+# Sensibilidad a la prior
+
+```{r sens-tabla}
+tab %>% transmute(prior, media = pct(media, 2), HPD = paste0("[", pct(hpd_lo, 2), "; ", pct(hpd_hi, 2), "]"),
+                  `P(p > p0)` = round(P_mayor_p0, 3), `P(ROPE)` = round(P_rope, 3), BF01 = round(BF01, 2), `P(H0|datos)` = round(P_H0, 3))
+```
+
+Para ver el mecanismo completo, se barre el **peso** $m$ de una prior centrada en $\bar p$ (sin cambiar el centro):
+
+```{r sens-barrido}
+ms <- 10^seq(log10(2), 5.3, length.out = 120)
+barrido <- tibble(m = ms) %>% rowwise() %>%
+  mutate(a = p_b * m, b = (1 - p_b) * m,
+         media = (a + x) / (a + b + n), P_mayor = 1 - pbeta(p0, a + x, b + n - x),
+         BF01 = exp(dbinom(x, n, p0, log = TRUE) - lbb(x, n, a, b))) %>% ungroup()
+g1 <- ggplot(barrido, aes(m, media)) + geom_line() + geom_hline(yintercept = c(x / n, p_b), linetype = 3) +
+  scale_x_log10() + scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  geom_vline(xintercept = m_hat, colour = "firebrick", linetype = 2) +
+  labs(x = "Peso de la prior m = α + β (siniestros imaginarios, escala log)", y = "Media posterior",
+       title = "La media posterior se mueve de los datos (arriba) hacia la prior (abajo)",
+       subtitle = "Roja: peso calibrado con los datos entre localidades")
+g2 <- ggplot(barrido, aes(m, BF01)) + geom_line() + geom_hline(yintercept = 1, linetype = 3) + scale_x_log10() + scale_y_log10() +
+  geom_vline(xintercept = m_hat, colour = "firebrick", linetype = 2) +
+  labs(x = "Peso de la prior m (escala log)", y = "BF01 (escala log)",
+       title = "Factor de Bayes a favor de H0 según el peso de la prior")
+g1; g2
+```
+
+**La advertencia del factor de Bayes.** Con priors muy difusas (uniforme, Jeffreys) el $BF_{01}$ **favorece $H_0$**, aunque la proporción observada de Usme sea casi el doble de la de Bogotá. No es un error: es la **paradoja de Lindley–Jeffreys**. Una $H_1$ que reparte su probabilidad en todo $[0,1]$ asigna poca densidad a los valores cercanos a $p_0$ y se «castiga» por ser vaga. Por eso el $BF$ de una hipótesis puntual es muy sensible a la prior de $H_1$, y por eso aquí se reporta junto a $P(p>p_0\mid\text{datos})$ y al ROPE, que **no** sufren ese problema. La curva muestra además que, con el peso más favorable a $H_1$ ($m$ cercano a 200), el $BF_{01}$ baja solo hasta ≈ 0,5, es decir $BF_{10} \approx 2$: **evidencia débil a favor de que Usme difiera de Bogotá**, no concluyente. Con 17 fatales, los datos de un solo año no alcanzan para más.
+
+# Comparación pre-pandemia vs 2020
+
+Dos preguntas distintas, con priors uniformes (los datos dominan) y simulación Monte Carlo de 200.000 extracciones por posterior:
+
+```{r comparacion}
+B <- 2e5
+post <- function(xx, nn) rbeta(B, 1 + xx, 1 + nn - xx)
+u19 <- post(x_u0, n_u0); u20 <- post(x, n)
+b19 <- post(x_b, n_b);  b20 <- post(sum(s$fatal[s$anio == 2020]), sum(s$anio == 2020))
+res <- function(v) c(media = mean(v), lo = quantile(v, .025, names = FALSE), hi = quantile(v, .975, names = FALSE))
+comp <- rbind(
+  "Usme 2020 − Usme 2015–19"       = c(res(u20 - u19), P_pos = mean(u20 > u19)),
+  "Bogotá 2020 − Bogotá 2015–19"   = c(res(b20 - b19), P_pos = mean(b20 > b19)),
+  "Usme − Bogotá (2015–19)"        = c(res(u19 - b19), P_pos = mean(u19 > b19)),
+  "Usme − Bogotá (2020)"           = c(res(u20 - b20), P_pos = mean(u20 > b20)))
+round(comp, 4)
+```
+
+```{r razon}
+razon <- rbind("Usme / Bogotá (2015–19)" = res(u19 / b19), "Usme / Bogotá (2020)" = res(u20 / b20))
+round(razon, 2)
+```
+
+**Lectura.** (1) ¿Cambió la proporción fatal de Usme en 2020 respecto a 2015–2019? La probabilidad posterior de que haya subido es `r num(comp[1, "P_pos"], 2)`; el intervalo de la diferencia incluye el cero, así que **no hay evidencia clara de cambio** (con solo 17 fatales en 2020, el dato es poco informativo). (2) ¿Es Usme más letal que Bogotá? **Ya lo era antes de la pandemia**: la razón Usme/Bogotá en 2015–19 es `r num(razon[1, "media"], 2)` (IC 95 %: `r num(razon[1, "lo"], 2)`–`r num(razon[1, "hi"], 2)`). Es decir, el hallazgo de 2020 no es un efecto de la cuarentena: es una diferencia **estructural** de la localidad. (3) En Bogotá, la proporción fatal de 2020 es ligeramente mayor que la de 2015–2019 (diferencia `r num(comp[2, "media"], 4)`, P(subió) = `r num(comp[2, "P_pos"], 2)`): un aumento de ~0,1 pp, pequeño y sin una causa que estos datos permitan identificar.
+
+# Validación predictiva
+
+## Actualización año a año
+
+Se parte de la prior calibrada y, al final de cada año, la posterior se usa como prior del siguiente.
+
+```{r actualizacion}
+a0 <- priors$a[1]; b0 <- priors$b[1]
+por_anio <- usme %>% group_by(anio) %>% summarise(n = n(), x = sum(fatal), .groups = "drop") %>% arrange(anio)
+sec <- por_anio %>% mutate(
+  a_post = a0 + cumsum(x), b_post = b0 + cumsum(n - x),
+  media = a_post / (a_post + b_post),
+  lo = qbeta(.025, a_post, b_post), hi = qbeta(.975, a_post, b_post),
+  prop_anio = x / n)
+ggplot(sec, aes(anio)) + geom_ribbon(aes(ymin = lo, ymax = hi), fill = "#9ecae1", alpha = .6) +
+  geom_line(aes(y = media), colour = "#08519c") + geom_point(aes(y = prop_anio), colour = "grey30") +
+  geom_hline(yintercept = p_b, linetype = 2) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(x = "Año", y = "Proporción fatal en Usme",
+       title = "Posterior acumulada de Usme (banda: IC 95 %) y proporción de cada año (puntos)",
+       subtitle = "Línea punteada: Bogotá 2015–19 (centro de la prior)")
+```
+
+## Predicción un año adelante
+
+Para cada año $t \ge 2016$ se usa la posterior acumulada hasta $t-1$ y se calcula la **distribución predictiva Beta–Binomial** del número de fatales en los $n_t$ siniestros de ese año.
+
+```{r predictiva}
+bb_pmf <- function(n, a, b) exp(lbb(0:n, n, a, b))
+filas <- lapply(2:nrow(sec), function(i) {
+  a <- a0 + sum(por_anio$x[1:(i - 1)]); b <- b0 + sum(por_anio$n[1:(i - 1)] - por_anio$x[1:(i - 1)])
+  nn <- por_anio$n[i]; xx <- por_anio$x[i]
+  pmf <- bb_pmf(nn, a, b); cdf <- cumsum(pmf)
+  tibble(anio = por_anio$anio[i], n = nn, esperado = sum((0:nn) * pmf),
+         lo = which(cdf >= 0.025)[1] - 1, hi = which(cdf >= 0.975)[1] - 1, observado = xx,
+         `P(X >= obs)` = sum(pmf[(xx + 1):(nn + 1)]), dentro = xx >= lo & xx <= hi)
+})
+pred <- bind_rows(filas)
+pred %>% mutate(esperado = round(esperado, 1), `P(X >= obs)` = round(`P(X >= obs)`, 3))
+```
+
+```{r pred-2020}
+# Solo con el prior calibrado, sin datos de Usme, para 2020
+pm <- bb_pmf(n, a0, b0); cdf0 <- cumsum(pm)
+c(esperado_solo_prior = sum((0:n) * pm), lo = which(cdf0 >= .025)[1] - 1, hi = which(cdf0 >= .975)[1] - 1, observado = x,
+  P_X_mayor_igual_obs = sum(pm[(x + 1):(n + 1)]))
+```
+
+Un buen modelo debería capturar los conteos observados dentro de su rango del 95 %: aquí lo hacen **`r sum(pred$dentro)` de `r nrow(pred)` años**. Para 2020, además, el modelo *solo con el prior* (sin ningún dato de Usme) esperaba `r round(sum((0:n) * pm), 1)` fatales (rango 95 %: `r which(cdf0 >= .025)[1] - 1`–`r which(cdf0 >= .975)[1] - 1`) y se observaron `r x`; con los datos de 2015–2019 de la localidad el modelo esperaba `r round(pred$esperado[pred$anio == 2020], 1)`. Es decir, **los datos de la localidad mejoran la predicción**: el prior de Bogotá, por sí solo, tiende a subestimar a Usme (aunque 17 aún cae dentro de su rango del 95 %).
+
+*Nota de rigor:* con solo 5 años y conteos pequeños, la capacidad de rechazar el modelo es baja, y el centro del prior (Bogotá 2015–2019) incluye años que luego se «predicen», una fuga de información menor frente al tamaño de Bogotá (173.000 siniestros).
+
+# Segundo modelo: Gamma–Poisson para el conteo mensual de fatales en Usme
+
+El modelo Beta–Binomial condiciona en el número de siniestros ($n$ conocido). Aquí se modela otra cosa: **cuántos siniestros fatales ocurren por mes** en Usme, sin condicionar en el flujo total. Sea $y_t$ el conteo del mes $t$:
+
+$$y_t \mid \theta \sim \text{Poisson}(\theta), \qquad \theta \sim \text{Gamma}(a, b) \;\Longrightarrow\; \theta \mid y \sim \text{Gamma}\Big(a + \sum y_t,\ b + n_{\text{meses}}\Big),$$
+
+con $\theta$ = siniestros fatales esperados por mes (parametrización forma–tasa). La **predictiva posterior** del total de $m$ meses futuros es Binomial Negativa:
+
+$$\sum_{s=1}^{m} y^{\text{nuevo}}_s \mid y \;\sim\; \text{NB}\Big(\text{size}=a+\textstyle\sum y_t,\ \ \text{prob}=\tfrac{b+n_{\text{meses}}}{b+n_{\text{meses}}+m}\Big)$$
+
+(en R, `rnbinom` cuenta *fracasos*, y esa es la parametrización usada).
+
+```{r gp-datos}
+meses <- tibble(mes = seq(as.Date("2015-01-01"), as.Date("2020-12-01"), by = "month"))
+mes_usme <- usme %>% mutate(mes = as.Date(format(FECHA, "%Y-%m-01"))) %>%
+  group_by(mes) %>% summarise(y = sum(fatal), sin = n(), .groups = "drop")
+mes_usme <- meses %>% left_join(mes_usme, by = "mes") %>%
+  mutate(y = coalesce(y, 0L), sin = coalesce(sin, 0L), anio = as.integer(format(mes, "%Y")))
+y_prev <- mes_usme$y[mes_usme$anio <= 2019]; y_20 <- mes_usme$y[mes_usme$anio == 2020]
+tibble(periodo = c("2015–2019", "2020"), meses = c(length(y_prev), length(y_20)), fatales = c(sum(y_prev), sum(y_20)),
+       media_mensual = c(mean(y_prev), mean(y_20)), varianza = c(var(y_prev), var(y_20)),
+       siniestros_por_mes = c(mean(mes_usme$sin[mes_usme$anio <= 2019]), mean(mes_usme$sin[mes_usme$anio == 2020]))) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+## ¿Los conteos mensuales son Poisson?
+
+Poisson implica **media = varianza** (índice de dispersión 1) y una forma de frecuencias concreta. Se verifica con 2015–2019 (60 meses).
+
+```{r gp-supuestos}
+disp_idx <- var(y_prev) / mean(y_prev); D <- (length(y_prev) - 1) * disp_idx
+p_disp <- 2 * min(pchisq(D, length(y_prev) - 1), pchisq(D, length(y_prev) - 1, lower.tail = FALSE))
+# bondad de ajuste: colas agrupadas hasta esperado >= 5
+lam <- mean(y_prev); k <- length(y_prev); mx <- max(y_prev)
+obs <- tabulate(y_prev + 1, mx + 1); ex <- k * dpois(0:mx, lam); ex[mx + 1] <- ex[mx + 1] + k * ppois(mx, lam, lower.tail = FALSE)
+while (length(ex) > 2 && ex[1] < 5) { ex <- c(ex[1] + ex[2], ex[-(1:2)]); obs <- c(obs[1] + obs[2], obs[-(1:2)]) }
+while (length(ex) > 2 && ex[length(ex)] < 5) { L <- length(ex); ex <- c(ex[1:(L - 2)], ex[L - 1] + ex[L]); obs <- c(obs[1:(L - 2)], obs[L - 1] + obs[L]) }
+chi_p <- sum((obs - ex)^2 / ex); gl_p <- length(ex) - 2
+list(indice_dispersion = round(disp_idx, 3), p_dispersion = round(p_disp, 3),
+     gof = tibble(celda = seq_along(ex), observado = obs, esperado = round(ex, 1)),
+     chi2 = round(chi_p, 3), gl = gl_p, p_gof = round(pchisq(chi_p, gl_p, lower.tail = FALSE), 3))
+```
+
+**Lectura.** El índice de dispersión es `r round(disp_idx, 2)` (p = `r round(p_disp, 2)`) y la bondad de ajuste Poisson da p = `r round(pchisq(chi_p, gl_p, lower.tail = FALSE), 2)`: los conteos mensuales de fatales en Usme son **compatibles con una Poisson** (media ≈ varianza, sin sobredispersión). El modelo Gamma–Poisson es defendible aquí.
+
+## Priors y posterior
+
+Se consideran tres opiniones de partida sobre $\theta$ (todas con la parametrización forma–tasa):
+
+- **Jeffreys** para Poisson, $\text{Gamma}(\tfrac12, 0)$, que es impropia; se usa $\text{Gamma}(0{,}5;\,0{,}001)$ (prácticamente igual).
+- **Histórica completa**: la posterior de 2015–2019 con Jeffreys, $\text{Gamma}(0{,}5+\sum y_{\text{prev}},\ 60)$, que pesa como 60 meses.
+- **Histórica de 1 año**: misma media que la anterior pero con el peso de 12 meses.
+
+```{r gp-posterior}
+m_prev <- length(y_prev); m_20 <- length(y_20)
+th_hat <- (0.5 + sum(y_prev)) / m_prev
+gpri <- tibble(prior = c("Jeffreys Gamma(0,5; 0,001)", "Histórica completa (60 meses)", "Histórica de 1 año (12 meses)"),
+               a = c(0.5, 0.5 + sum(y_prev), th_hat * 12), b = c(0.001, m_prev, 12))
+hpd_gen <- function(qf, level = 0.95) {
+  f <- function(p) qf(p + level) - qf(p); p <- optimize(f, c(0, 1 - level))$minimum; qf(c(p, p + level))
+}
+gp_tab <- bind_rows(lapply(seq_len(nrow(gpri)), function(i) {
+  A <- gpri$a[i] + sum(y_20); Bt <- gpri$b[i] + m_20; h <- hpd_gen(function(p) qgamma(p, A, Bt))
+  tibble(prior = gpri$prior[i], alfa_post = A, tasa_post = Bt, media = A / Bt, hpd_lo = h[1], hpd_hi = h[2],
+         P_menor_hist = pgamma(th_hat, A, Bt, lower.tail = TRUE))
+}))
+gp_tab %>% mutate(across(where(is.numeric), ~ round(.x, 3)))
+```
+
+**Comparación 2020 vs 2015–2019** (ambas con Jeffreys, simulación de 200.000 extracciones):
+
+```{r gp-comparacion}
+B2 <- 2e5
+th19 <- rgamma(B2, 0.5 + sum(y_prev), 0.001 + m_prev); th20 <- rgamma(B2, 0.5 + sum(y_20), 0.001 + m_20)
+rr <- th20 / th19
+c(media_19 = mean(th19), media_20 = mean(th20), razon_media = mean(rr),
+  razon_lo = quantile(rr, .025, names = FALSE), razon_hi = quantile(rr, .975, names = FALSE),
+  P_baja = mean(th20 < th19)) %>% round(3)
+```
+
+**Lectura.** La tasa mensual de fatales pasa de `r round(mean(th19), 2)` (2015–2019) a `r round(mean(th20), 2)` (2020): razón `r round(mean(rr), 2)` (IC 95 %: `r round(quantile(rr, .025, names = FALSE), 2)`–`r round(quantile(rr, .975, names = FALSE), 2)`) y P(baja) = `r round(mean(th20 < th19), 2)`. Hay una **tendencia a la baja, pero no evidencia concluyente** (el intervalo incluye 1). Coherente con lo visto antes: en 2020 hubo menos siniestros por mes en Usme (`r round(mean(mes_usme$sin[mes_usme$anio == 2020]), 0)` frente a `r round(mean(mes_usme$sin[mes_usme$anio <= 2019]), 0)`), pero la *proporción* fatal se mantuvo. Los dos modelos cuentan la misma historia desde ángulos distintos: Beta–Binomial = letalidad por siniestro; Gamma–Poisson = fatales por mes (depende del flujo).
+
+## Predictiva posterior (Binomial Negativa)
+
+Con la posterior de **solo 2015–2019**, ¿cuántos fatales se esperaban en los 12 meses de 2020? Se compara con los 17 observados.
+
+```{r gp-predictiva}
+sz <- 0.5 + sum(y_prev); pr <- (0.001 + m_prev) / (0.001 + m_prev + 12)   # prob de NB para suma de 12 meses
+x20 <- sum(y_20)
+nb <- tibble(k = 0:50) %>% mutate(p = dnbinom(k, size = sz, prob = pr))
+sim_nb <- rnbinom(B2, size = sz, mu = sz * (1 - pr) / pr)
+sim_gp <- rpois(B2, 12 * rgamma(B2, sz, 0.001 + m_prev))       # misma predictiva por simulación gamma -> poisson
+tibble(metodo = c("Analítica NB", "Simulación NB", "Simulación Gamma→Poisson"),
+       esperado = c(sz * (1 - pr) / pr, mean(sim_nb), mean(sim_gp)),
+       lo = c(qnbinom(.025, sz, pr), quantile(sim_nb, .025), quantile(sim_gp, .025)),
+       hi = c(qnbinom(.975, sz, pr), quantile(sim_nb, .975), quantile(sim_gp, .975)),
+       `P(X <= obs)` = c(pnbinom(x20, sz, pr), mean(sim_nb <= x20), mean(sim_gp <= x20))) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+ggplot(nb, aes(k, p, fill = k <= x20)) + geom_col(show.legend = FALSE) +
+  geom_vline(xintercept = x20 + 0.5, colour = "firebrick", linetype = 2) +
+  scale_fill_manual(values = c("grey70", "#9ecae1")) +
+  labs(x = "Fatales en los 12 meses de 2020", y = "Probabilidad predictiva",
+       title = "Predictiva Binomial Negativa para Usme 2020 (con datos 2015–2019)",
+       subtitle = "Línea roja: valor observado (17). Azul: P(X ≤ observado)")
+```
+
+**Lectura.** Con solo los datos de 2015–2019 se esperaban `r round(sz * (1 - pr) / pr, 1)` fatales en 2020 (rango 95 %: `r qnbinom(.025, sz, pr)`–`r qnbinom(.975, sz, pr)`); se observaron `r x20`, con P(X ≤ 17) = `r round(pnbinom(x20, sz, pr), 2)`. El dato **cae dentro del rango predictivo**: el modelo no rechaza que 2020 fuera un año «normal» de fatales en Usme. Las tres filas (analítica, simulación NB y simulación Gamma→Poisson) coinciden, lo que **verifica la fórmula** de la predictiva.
+
+# Estimadores de Bayes con cinco funciones de pérdida
+
+Una vez que se tiene la posterior $p\mid x \sim \text{Beta}(A, B)$, «la» estimación depende de **cuánto cuesta equivocarse y en qué dirección**. Cada función de pérdida $L(d, p)$ tiene su estimador de Bayes $d^* = \arg\min_d E[L(d,p)\mid x]$:
+
+| Función de pérdida | $L(d,p)$ | Estimador de Bayes | Con posterior Beta$(A,B)$ |
+|---|---|---|---|
+| Cuadrática | $(d-p)^2$ | media posterior | $\dfrac{A}{A+B}$ |
+| Cuadrática relativa | $\dfrac{(d-p)^2}{p}$ | $\dfrac{1}{E[1/p\mid x]}$ | $\dfrac{A-1}{A+B-1}$ |
+| Lineal asimétrica | $c_1(d-p)$ si $d>p$; $c_2(p-d)$ si $d<p$ | cuantil $\dfrac{c_2}{c_1+c_2}$ | cuantil de la Beta |
+| Todo o nada | $\mathbb{1}\{\lvert d-p\rvert>\varepsilon\}$ | moda posterior ($\varepsilon\to 0$) | $\dfrac{A-1}{A+B-2}$ |
+| LINEX | $e^{a(d-p)}-a(d-p)-1$ | $-\dfrac{1}{a}\ln E\big[e^{-ap}\mid x\big]$ | integral numérica |
+
+**Elecciones del decisor (supuestos explícitos).** En seguridad vial es más grave *subestimar* la letalidad que sobreestimarla. Por eso: en la lineal asimétrica, subestimar cuesta $c_2 = 3$ veces más que sobreestimar ($c_1 = 1$), lo que da el cuantil 0,75; en LINEX, $a = -100$ (la penalización es exponencial al *subestimar*); en todo o nada, $\varepsilon = 0{,}0005$ (0,05 pp).
+
+```{r perdidas}
+C1 <- 1; C2 <- 3; a_lx <- -100; eps <- 0.0005
+estimadores <- function(A, B) {
+  c(`Cuadrática (media)`      = A / (A + B),
+    `Cuadrática relativa`     = (A - 1) / (A + B - 1),
+    `Lineal asimétrica (q 0,75)` = qbeta(C2 / (C1 + C2), A, B),
+    `Todo o nada (moda)`      = (A - 1) / (A + B - 2),
+    `LINEX (a = -100)`        = -(1 / a_lx) * log(integrate(function(p) exp(-a_lx * p) * dbeta(p, A, B), 0, 1)$value))
+}
+perdida_esp <- function(d, A, B, tipo) {                       # E[L(d, p) | x]
+  f <- switch(tipo,
+    cuad  = function(p) (d - p)^2,
+    rel   = function(p) (d - p)^2 / p,
+    lin   = function(p) ifelse(d > p, C1 * (d - p), C2 * (p - d)),
+    todo  = function(p) as.numeric(abs(d - p) > eps),
+    linex = function(p) exp(a_lx * (d - p)) - a_lx * (d - p) - 1)
+  integrate(function(p) f(p) * dbeta(p, A, B), 0, 1, subdivisions = 500, rel.tol = 1e-8)$value
+}
+sel <- c(1, 4)   # prior calibrada y uniforme
+est_tab <- bind_rows(lapply(sel, function(i) {
+  A <- priors$a[i] + x; B <- priors$b[i] + n - x; e <- estimadores(A, B)
+  tibble(prior = priors$prior[i], perdida = names(e), estimador = e)
+}))
+est_ancho <- est_tab %>% pivot_wider(names_from = prior, values_from = estimador)
+est_ancho %>% mutate(across(where(is.numeric), ~ round(100 * .x, 3))) %>% rename_with(~ paste0(.x, " (%)"), -perdida)
+```
+
+```{r perdidas-spread}
+spread <- est_tab %>% group_by(prior) %>% summarise(minimo = min(estimador), maximo = max(estimador), rango_pp = 100 * (max(estimador) - min(estimador)))
+spread %>% mutate(across(c(minimo, maximo), ~ round(100 * .x, 3)), rango_pp = round(rango_pp, 3))
+```
+
+**Lectura.** Con la prior calibrada, los cinco estimadores van de `r round(100 * spread$minimo[1], 2)` % a `r round(100 * spread$maximo[1], 2)` % (rango `r round(spread$rango_pp[1], 2)` pp); con la uniforme, de `r round(100 * spread$minimo[2], 2)` % a `r round(100 * spread$maximo[2], 2)` % (rango `r round(spread$rango_pp[2], 2)` pp). **Cuanto más incierta la posterior, más se separan los estimadores**: la misma proporción fatal «vale» cosas distintas según la pérdida. La lineal asimétrica y la LINEX (que castigan subestimar) dan los valores más altos; la cuadrática relativa y la moda, los más bajos.
+
+**Cada estimador es óptimo bajo *su* pérdida.** La tabla cruza los cinco estimadores (filas, prior calibrada) con las cinco pérdidas (columnas): cada celda es la pérdida esperada posterior dividida por la mínima de su columna (1,00 = óptimo).
+
+```{r perdidas-cruce}
+A1 <- priors$a[1] + x; B1 <- priors$b[1] + n - x; e1 <- estimadores(A1, B1)
+tipos <- c(cuad = "cuad", rel = "rel", lin = "lin", todo = "todo", linex = "linex")
+M <- sapply(tipos, function(tp) sapply(e1, function(d) perdida_esp(d, A1, B1, tp)))
+rownames(M) <- names(e1)
+round(sweep(M, 2, apply(M, 2, min), "/"), 3)
+```
+
+La diagonal (≈ 1,000) confirma que cada estimador es el óptimo bajo su pérdida; fuera de la diagonal, usar el estimador «equivocado» cuesta entre un par de % y casi el doble en pérdida esperada (p. ej., reportar la media cuando el decisor tiene pérdida lineal asimétrica).
+
+```{r perdidas-grafico}
+dd <- tibble(p = seq(0.005, 0.05, length.out = 600)) %>% mutate(d = dbeta(p, A1, B1))
+ggplot(dd, aes(p, d)) + geom_line() +
+  geom_vline(data = tibble(estimador = names(e1), v = e1), aes(xintercept = v, colour = estimador), linewidth = .7) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 0.1)) +
+  labs(x = "Proporción fatal p", y = "Densidad posterior", colour = NULL,
+       title = "Posterior de Usme (prior calibrada) y los cinco estimadores de Bayes")
+```
+
+# Verificación con JAGS
+
+JAGS aproxima la posterior por MCMC (Gibbs). En modelos conjugados no hace falta, pero sirve para **comprobar que la implementación y la teoría coinciden**; luego se usa en un modelo que **no** tiene forma cerrada.
+
+## Beta–Binomial: JAGS vs posterior analítica
+
+```{r jags-bb}
+mod_bb <- "
+model {
+  x ~ dbin(p, n)
+  p ~ dbeta(a0, b0)
+}"
+correr_jags <- function(modelo, datos, nodos, n.adapt = 2000, burn = 4000, iter = 40000, chains = 3) {
+  m <- jags.model(textConnection(modelo), data = datos, n.chains = chains, n.adapt = n.adapt, quiet = TRUE)
+  update(m, burn, progress.bar = "none")
+  coda.samples(m, nodos, n.iter = iter, progress.bar = "none")
+}
+jb <- lapply(c(1, 4), function(i) correr_jags(mod_bb, list(x = x, n = n, a0 = priors$a[i], b0 = priors$b[i]), "p"))
+comp_bb <- bind_rows(lapply(seq_along(jb), function(k) {
+  i <- c(1, 4)[k]; v <- as.numeric(as.matrix(jb[[k]])); A <- priors$a[i] + x; Bt <- priors$b[i] + n - x
+  tibble(prior = priors$prior[i], fuente = c("Analítica", "JAGS"),
+         media = c(A / (A + Bt), mean(v)), lo = c(qbeta(.025, A, Bt), quantile(v, .025, names = FALSE)),
+         hi = c(qbeta(.975, A, Bt), quantile(v, .975, names = FALSE)),
+         `P(p > p0)` = c(1 - pbeta(p0, A, Bt), mean(v > p0)),
+         Rhat = c(NA, gelman.diag(jb[[k]])$psrf[1, 1]), n_efectivo = c(NA, effectiveSize(jb[[k]])))
+}))
+comp_bb %>% mutate(across(where(is.numeric), ~ round(.x, 4)))
+```
+
+## Gamma–Poisson: JAGS vs analítica y predictiva
+
+```{r jags-gp}
+mod_gp <- "
+model {
+  for (t in 1:T) { y[t] ~ dpois(theta) }
+  theta ~ dgamma(a0, b0)
+  ynew ~ dpois(12 * theta)     # total de 12 meses nuevos
+}"
+# Datos de 2020 con el prior histórico de 1 año; predictiva de 12 meses futuros
+jg <- correr_jags(mod_gp, list(y = y_20, T = length(y_20), a0 = gpri$a[3], b0 = gpri$b[3]), c("theta", "ynew"))
+Ag <- gpri$a[3] + sum(y_20); Bg <- gpri$b[3] + length(y_20)
+vt <- as.numeric(as.matrix(jg)[, "theta"]); vy <- as.numeric(as.matrix(jg)[, "ynew"])
+tibble(cantidad = c("theta: media", "theta: IC95 inferior", "theta: IC95 superior", "ynew: media", "ynew: P(<= 17)"),
+       analitica = c(Ag / Bg, qgamma(.025, Ag, Bg), qgamma(.975, Ag, Bg), 12 * Ag / Bg,
+                     pnbinom(sum(y_20), size = Ag, prob = Bg / (Bg + 12))),
+       JAGS = c(mean(vt), quantile(vt, .025, names = FALSE), quantile(vt, .975, names = FALSE), mean(vy), mean(vy <= sum(y_20)))) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+c(Rhat_theta = unname(gelman.diag(jg[, "theta"])$psrf[1, 1]))
+```
+
+## Extensión jerárquica (sin forma cerrada): las 19 localidades a la vez
+
+La prior calibrada fija el peso $m$ con 2015–2019 y lo trata como conocido. Un modelo **jerárquico** estima ese peso con los datos y reparte la incertidumbre: cada localidad tiene su $p_j$, y todas comparten una distribución Beta con media $\mu$ y concentración $\kappa$ desconocidas (**encogimiento parcial**). Se ajusta con los datos de **2020** de las 19 localidades (Sumapaz se excluye):
+
+$$x_j \mid p_j \sim \text{Bin}(n_j, p_j),\qquad p_j \sim \text{Beta}\big(\mu\kappa,\ (1-\mu)\kappa\big),\qquad \mu \sim \text{Beta}(1,1),\quad \kappa \sim \text{Gamma}(1, 0{,}001).$$
+
+```{r jags-jerarquico}
+d20 <- s %>% filter(anio == 2020, localidad != "Sumapaz") %>% group_by(localidad) %>%
+  summarise(n = n(), x = sum(fatal), .groups = "drop") %>% arrange(localidad)
+mod_h <- "
+model {
+  for (j in 1:J) { x[j] ~ dbin(p[j], n[j]); p[j] ~ dbeta(mu * kappa, (1 - mu) * kappa) }
+  mu ~ dbeta(1, 1)
+  kappa ~ dgamma(1, 0.001)
+}"
+jh <- correr_jags(mod_h, list(x = d20$x, n = d20$n, J = nrow(d20)), c("p", "mu", "kappa"), burn = 6000, iter = 60000)
+sm <- summary(jh)
+iu <- which(d20$localidad == "Usme")
+pu <- as.matrix(jh)[, paste0("p[", iu, "]")]
+comp_h <- tibble(
+  enfoque = c("Sin pooling (Usme solo, 2020)", "Pooling completo (Bogotá 2020)", "Prior calibrada (analítica)", "Jerárquico (JAGS)"),
+  media = c(x / n, p0, A1 / (A1 + B1), mean(pu)),
+  lo = c(qbeta(.025, 1 + x, 1 + n - x), NA, qbeta(.025, A1, B1), quantile(pu, .025, names = FALSE)),
+  hi = c(qbeta(.975, 1 + x, 1 + n - x), NA, qbeta(.975, A1, B1), quantile(pu, .975, names = FALSE)))
+comp_h %>% mutate(across(where(is.numeric), ~ round(100 * .x, 3))) %>% rename_with(~ paste0(.x, " (%)"), -enfoque)
+kap <- as.matrix(jh)[, "kappa"]
+c(Rhat_max_p = max(gelman.diag(jh[, grep("^p\\[", varnames(jh))])$psrf[, 1]), Rhat_kappa = unname(gelman.diag(jh[, "kappa"])$psrf[1, 1]),
+  kappa_mediana = median(kap), kappa_lo = quantile(kap, .025, names = FALSE), kappa_hi = quantile(kap, .975, names = FALSE),
+  mu_media = mean(as.matrix(jh)[, "mu"]), m_calibrado_2015_19 = m_hat) %>% round(4)
+```
+
+**Lectura (JAGS).**
+
+- **Verificación:** en Beta–Binomial y Gamma–Poisson, JAGS reproduce la solución analítica (medias, intervalos, probabilidades y predictiva coinciden a 3–4 cifras), con $\hat R \approx 1{,}00$ y decenas de miles de muestras efectivas. La teoría y el código son consistentes.
+- **Jerárquico:** estima para Usme `r round(100 * mean(pu), 2)` % (IC 95 %: `r round(100 * quantile(pu, .025, names = FALSE), 2)`–`r round(100 * quantile(pu, .975, names = FALSE), 2)` %), muy parecido a la prior calibrada (`r round(100 * A1 / (A1 + B1), 2)` %) y a medio camino entre «Usme solo» (`r round(100 * x / n, 2)` %) y «Bogotá» (`r round(100 * p0, 2)` %). La concentración estimada $\kappa$ tiene mediana `r round(median(kap))` (IC 95 %: `r round(quantile(kap, .025, names = FALSE))`–`r round(quantile(kap, .975, names = FALSE))`), que **contiene** el peso calibrado con 2015–2019 (`r round(m_hat)`): dos rutas independientes llevan a un nivel de encogimiento parecido.
+
+```{r jags-jerarquico-graf, fig.height=6}
+pj <- tibble(localidad = d20$localidad, crudo = d20$x / d20$n, jerarquico = sm$statistics[paste0("p[", seq_len(nrow(d20)), "]"), "Mean"])
+ggplot(pj, aes(crudo, jerarquico, label = localidad)) + geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  geom_hline(yintercept = mean(as.matrix(jh)[, "mu"]), colour = "grey50", linetype = 3) +
+  geom_point(aes(colour = localidad == "Usme"), show.legend = FALSE) + geom_text(size = 3, vjust = -0.8, check_overlap = TRUE) +
+  scale_colour_manual(values = c("grey30", "firebrick")) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) + scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = "Proporción fatal observada (2020)", y = "Media posterior jerárquica",
+       title = "Encogimiento parcial: las localidades se acercan al centro común",
+       subtitle = "Diagonal: sin encogimiento. Línea punteada: media global μ estimada")
+```
+
+# Resumen de supuestos, resultados y limitaciones
+
+```{r conclusiones, results='asis'}
+cat(sprintf("
+1. **Evento y supuestos.** La proporción fatal de Bogotá en 2015–2019 es %s. Independencia, forma binomial y dispersión no se rechazan; **sí se rechaza** que p sea constante entre años en Bogotá (diferencias pequeñas). La binomial es una **aproximación** razonable, con esa limitación declarada.
+2. **Usme 2020.** Se observaron %d fatales en %d siniestros (%s). Con la prior calibrada (peso %d siniestros), la proporción fatal posterior es %s (HPD 95 %%: [%s; %s]).
+3. **Usme vs Bogotá.** P(p > p0 | datos) = %s con la prior calibrada; con priors difusas sube a ≈ %s. El BF01 con priors difusas favorece H0 por la paradoja de Lindley y no debe usarse solo.
+4. **No es efecto pandemia.** Usme ya tenía una proporción fatal ≈ %s veces la de Bogotá en 2015–2019.
+5. **Predicción.** Un año adelante, %d de %d años observados caen dentro del rango predictivo al 95 %%.
+",
+pct(p_b, 2), x, n, pct(x / n, 2), round(m_hat), pct(r1$media, 2), pct(r1$hpd_lo, 2), pct(r1$hpd_hi, 2),
+num(r1$P_mayor_p0, 3), num(tab$P_mayor_p0[4], 3), num(razon[1, "media"], 2), sum(pred$dentro), nrow(pred)))
+```
+
+```{r conclusiones2, results='asis'}
+cat(sprintf("
+6. **Gamma–Poisson (fatales por mes).** Los conteos mensuales son compatibles con Poisson (índice de dispersión %s). La tasa mensual baja de %s a %s en 2020 (razón %s, IC 95 %%: %s–%s): tendencia a la baja, no concluyente. La predictiva Binomial Negativa esperaba %s fatales en 2020 (rango %d–%d) y se observaron %d.
+7. **Funciones de pérdida.** Los cinco estimadores de Bayes de p van de %s %% a %s %% con la prior calibrada (rango %s pp) y de %s %% a %s %% con la uniforme (rango %s pp): cuanto más incierta la posterior, más importa la pérdida elegida.
+8. **JAGS.** Reproduce las posteriores analíticas (Rhat ≈ 1). El modelo jerárquico da %s %% para Usme (IC 95 %%: %s–%s %%) y estima una concentración κ con mediana %d, que contiene el peso calibrado (%d).
+",
+round(disp_idx, 2), round(mean(th19), 2), round(mean(th20), 2), round(mean(rr), 2),
+round(quantile(rr, .025, names = FALSE), 2), round(quantile(rr, .975, names = FALSE), 2),
+round(sz * (1 - pr) / pr, 1), qnbinom(.025, sz, pr), qnbinom(.975, sz, pr), x20,
+round(100 * spread$minimo[1], 2), round(100 * spread$maximo[1], 2), round(spread$rango_pp[1], 2),
+round(100 * spread$minimo[2], 2), round(100 * spread$maximo[2], 2), round(spread$rango_pp[2], 2),
+round(100 * mean(pu), 2), round(100 * quantile(pu, .025, names = FALSE), 2), round(100 * quantile(pu, .975, names = FALSE), 2),
+as.integer(round(median(kap))), as.integer(round(m_hat))))
+```
+
+**Limitaciones.**
+
+- $p$ es una **proporción de letalidad**, no una tasa por habitante: Usme puede ser «más letal por siniestro» y aun así tener pocos siniestros por persona.
+- Los siniestros no son realmente intercambiables: hay dependencia espacial (corredores peligrosos) y horaria (la letalidad nocturna es mayor). Un modelo jerárquico con una $p$ por localidad (y covariables como hora y clase de siniestro) sería la extensión natural.
+- 2020 es atípico por la cuarentena; la validación predictiva con un solo año nuevo tiene poca potencia (17 fatales).
+- La prior calibrada usa 2015–2019 de **todas** las localidades, incluida Usme; su peso depende de la dispersión entre localidades y se verificó con el barrido de sensibilidad.
+- Gamma–Poisson modela fatales por mes sin condicionar en el flujo de siniestros: mezcla letalidad con volumen de tráfico.
+- Las constantes de las funciones de pérdida (c₂ = 3, a = −100, ε = 0,05 pp) son supuestos del decisor, no resultados.
+- El ancho del ROPE (±0,25 pp) es un supuesto de quien analiza; con otro ancho cambia $P(\text{ROPE})$, aunque no $P(p>p_0\mid\text{datos})$.
+
+# Información de la sesión
+
+```{r sesion}
+sessionInfo()
+```
