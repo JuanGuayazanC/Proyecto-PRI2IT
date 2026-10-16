@@ -1,0 +1,6 @@
+# Datos: se regeneran con scripts/00_importar.R (el xlsx pesa ~49 MB)
+data/raw/
+data/processed/
+.Rhistory
+.RData
+.Rproj.user/
