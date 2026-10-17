@@ -1,0 +1,876 @@
+---
+title: "¿Qué tan mortal es un siniestro vial en cada localidad de Bogotá?"
+author: "Maria Paula Bonilla Martinez · Juan Sebastián Guayazán Clavijo"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: hide
+subtitle: Probabilidad e Inferencia · Modelos bayesianos Beta–Binomial y Gamma–Poisson
+  con pruebas de bondad de ajuste
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options(OutDec = ",")   # coma decimal en todo el informe
+```
+
+# Librerías
+
+```{r}
+library(readxl)     
+library(dplyr)
+library(ggplot2)
+library(rjags)      # interfaz a JAGS (hay que instalar JAGS: https://mcmc-jags.sourceforge.io)
+library(coda)       # diagnósticos de convergencia
+```
+
+# Importar los datos
+
+El archivo de la Secretaría Distrital de Movilidad trae cinco hojas. Se usan dos: `SINIESTROS`
+(una fila por siniestro) y `ACTOR_VIAL` (una fila por persona involucrada). Leer el xlsx tarda
+alrededor de un minuto porque pesa casi 50 MB.
+
+```{r}
+archivo <- "siniestros_viales_consolidados_bogota_dc.xlsx"
+ruta <- if (file.exists(file.path("data", "raw", archivo))) file.path("data", "raw", archivo) else archivo   # en el repo o junto al Rmd
+sin   <- read_excel(ruta, sheet = "SINIESTROS", guess_max = 200000)   
+actor <- read_excel(ruta, sheet = "ACTOR_VIAL", guess_max = 200000)
+dim(sin); names(sin)
+```
+
+# Depuración
+
+```{r}
+nombres <- c("Usaquén","Chapinero","Santa Fe","San Cristóbal","Usme","Tunjuelito","Bosa",
+             "Kennedy","Fontibón","Engativá","Suba","Barrios Unidos","Teusaquillo","Los Mártires",
+             "Antonio Nariño","Puente Aranda","La Candelaria","Rafael Uribe Uribe",
+             "Ciudad Bolívar","Sumapaz")
+
+a_fecha <- function(x) if (inherits(x, c("Date", "POSIXct"))) as.Date(x) else as.Date(x, "%d/%m/%Y")
+
+sin <- sin %>%
+  mutate(fecha = a_fecha(FECHA),
+         hora  = as.character(HORA),
+         anio  = as.integer(format(fecha, "%Y")),
+         fila  = row_number(),
+         y     = as.integer(GRAVEDAD == 1),                       # 1 = siniestro con muertos
+         localidad  = nombres[CODIGO_LOCALIDAD],
+         cuarentena = fecha >= as.Date("2020-03-25") & fecha <= as.Date("2020-08-31")) %>%
+  arrange(fecha, hora, fila)                                      # orden cronologico
+
+# faltantes y duplicados en las variables que se usan
+c(faltantes  = sum(is.na(sin$GRAVEDAD) | is.na(sin$fecha) | is.na(sin$CODIGO_LOCALIDAD)),
+  duplicados = sum(duplicated(sin$CODIGO_ACCIDENTE)))
+
+table(sin$GRAVEDAD)   # 1 = con muertos, 2 = con heridos, 3 = solo daños
+
+hist <- sin %>% filter(anio <= 2017)                  # historico -> prior
+rec  <- sin %>% filter(anio >= 2018, !cuarentena)     # reciente  -> verosimilitud
+cua  <- sin %>% filter(cuarentena)                    # cuarentena 2020
+p0   <- mean(rec$y)                                   # tasa de Bogota, periodo reciente
+c(historico = nrow(hist), reciente = nrow(rec), cuarentena = nrow(cua), p0 = p0)
+```
+
+No hay faltantes ni duplicados. Hay 196.152 siniestros: 101.500 históricos (2015–2017), 87.929
+recientes (2018–2020 sin cuarentena) y 6.723 de la cuarentena. La tasa de Bogotá en el periodo
+reciente es p₀ = 1.234 / 87.929 = 1,40 %.
+
+# Análisis exploratorio
+
+```{r}
+round(100 * prop.table(table(sin$GRAVEDAD)), 2)
+
+# tasa por anio con IC exacto
+ta <- sin %>% group_by(anio) %>%
+  summarise(n = n(), y = sum(y), p = y / n,
+            li = qbeta(0.025, y, n - y + 1), ls = qbeta(0.975, y + 1, n - y), .groups = "drop")
+ta
+c(cuarentena = mean(cua$y))
+
+ggplot(ta, aes(factor(anio), p)) +
+  geom_errorbar(aes(ymin = li, ymax = ls), width = 0.2, color = "#2a78d6") +
+  geom_point(size = 2.5, color = "#2a78d6") +
+  geom_hline(yintercept = mean(cua$y), linetype = "dashed", color = "#eb6834") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = NULL, y = "Siniestros con muertos", caption = "Línea naranja: cuarentena 2020") +
+  theme_minimal()
+```
+
+El 1,5 % de los siniestros deja muertos, el 33,3 % heridos y el 65,2 % solo daños. La tasa bajó de
+1,69 % (2015) a 1,35 % (2018) y en la cuarentena subió a 1,89 %.
+
+```{r fig.width=10, fig.height=4}
+# serie mensual 2019-2020: menos siniestros, pero mas mortales
+mes <- sin %>% filter(fecha >= as.Date("2019-01-01")) %>%
+  mutate(mes = format(fecha, "%Y-%m")) %>%
+  group_by(mes) %>% summarise(n = n(), y = sum(y), p = y / n, .groups = "drop")
+mes %>% filter(mes >= "2020-01")
+
+ggplot(mes, aes(mes, p, group = 1)) + geom_line(color = "#2a78d6") + geom_point(color = "#2a78d6") +
+  annotate("rect", xmin = "2020-04", xmax = "2020-08", ymin = -Inf, ymax = Inf, alpha = 0.15, fill = "#eb6834") +
+  scale_y_continuous(labels = scales::percent) + labs(x = NULL, y = "% con muertos") +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 90, size = 7))
+```
+
+En abril de 2020 hubo 687 siniestros (frente a unos 2.800 al mes en 2019) y el 3,1 % dejó muertos:
+el doble de lo normal.
+
+```{r}
+# quien muere: condicion del actor vial fallecido
+actor %>% filter(ESTADO == "MUERTO") %>% count(CONDICION, sort = TRUE) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+
+# que tan mortal es cada clase de siniestro
+clases <- c("Choque","Atropello","Volcamiento","Caida de ocupante","Incendio","Otro","Autolesion")
+sin %>% group_by(clase = clases[CLASE]) %>% summarise(n = n(), y = sum(y), p = round(100 * y / n, 2)) %>%
+  arrange(desc(p))
+
+# tasa por localidad en el periodo reciente
+rec %>% group_by(localidad) %>% summarise(n = n(), y = sum(y), p = round(100 * y / n, 2)) %>%
+  arrange(desc(p))
+```
+
+El 46,6 % de los fallecidos son peatones y el 28,5 % motociclistas. Un atropello deja muertos el
+6,9 % de las veces y un choque el 0,8 %. Por localidad la tasa va de 0,77 % (Usaquén, Chapinero) a
+3,42 % (Usme); Kennedy acumula más siniestros con muertos que cualquier otra, pero con una tasa
+(1,50 %) parecida a la de la ciudad.
+
+---
+
+# ¿Es binomial? Pruebas de supuestos
+
+Para que Y, el número de siniestros con muertos entre n siniestros, sea binomial se necesitan cuatro
+cosas: dos resultados, n fijo, independencia y probabilidad constante. Las dos primeras se cumplen por
+construcción. Las otras se prueban en el periodo reciente para **Bogotá**, para **Usme** (localidad
+principal) y para **Kennedy** (comparación).
+
+```{r}
+bog <- rec
+usm <- rec %>% filter(CODIGO_LOCALIDAD == 5)
+ken <- rec %>% filter(CODIGO_LOCALIDAD == 8)
+```
+
+## Supuesto 1 · Independencia: prueba de rachas
+
+```{r}
+rachas <- function(x) {
+  n1 <- sum(x == 1); n0 <- sum(x == 0); n <- n1 + n0
+  R  <- 1 + sum(x[-1] != x[-n])                          # rachas observadas
+  mu <- 2 * n1 * n0 / n + 1                               # esperadas si hay independencia
+  v  <- 2 * n1 * n0 * (2 * n1 * n0 - n) / (n^2 * (n - 1))
+  z  <- (R - mu) / sqrt(v)
+  c(rachas = R, esperadas = mu, z = z, p_valor = 2 * pnorm(-abs(z)))
+}
+rbind(Bogota = rachas(bog$y), Usme = rachas(usm$y), Kennedy = rachas(ken$y))
+```
+
+Bogotá: 2.425 rachas contra 2.434 esperadas, `p = 0,25`. Usme `p = 0,53`, Kennedy `p = 0,89`. **No hay
+evidencia de que la gravedad de un siniestro influya en la del siguiente.**
+
+## Supuesto 2 · Probabilidad constante: homogeneidad
+
+```{r}
+homog <- function(dd, g) {
+  t <- dd %>% group_by(.data[[g]]) %>% summarise(y = sum(y), n = n(), .groups = "drop")
+  chisq.test(cbind(t$y, t$n - t$y), correct = FALSE)
+}
+homog(bog, "anio"); homog(usm, "anio"); homog(ken, "anio")      # 2018-2020: se cumple
+
+homog(sin %>% filter(!cuarentena), "anio")                       # 2015-2020: NO se cumple
+homog(bind_rows(rec %>% mutate(g = "normal"), cua %>% mutate(g = "cuarentena")), "g")
+homog(rec %>% filter(CODIGO_LOCALIDAD != 20), "localidad")       # entre localidades: NO
+```
+
+Entre 2018 y 2020 la probabilidad es constante en Bogotá (`p = 0,35`), Usme (`p = 0,74`) y Kennedy
+(`p = 0,28`). Con los seis años juntos se rechaza (`chi2 = 18,2`, `gl = 5`, `p = 0,003`): por eso el
+histórico va en la prior. También se rechaza que la cuarentena tenga la misma p que el periodo normal
+(`p = 0,001`) y que las 19 localidades compartan la misma p (`chi2 = 187,3`, `gl = 18`,
+`p < 0,0001`): por eso cada localidad se modela por separado.
+
+## Supuesto 3 · Forma binomial: bondad de ajuste en grupos de 50
+
+La p es pequeña (≈ 1,4 %), así que en grupos de 10 casi todo sería cero. Se usan grupos de 50
+siniestros consecutivos dentro de cada año: en promedio 0,7 con muertos en Bogotá y 1,8 en Usme.
+
+```{r}
+# conteos de exitos en grupos de m siniestros consecutivos, dentro de cada anio
+grupos <- function(dd, m) {
+  unlist(lapply(split(dd$y, dd$anio, drop = TRUE), function(v) {
+    k <- length(v) %/% m
+    if (k == 0) integer(0) else sapply(1:k, function(j) sum(v[((j - 1) * m + 1):(j * m)]))
+  }), use.names = FALSE)
+}
+
+# chi-cuadrado de bondad de ajuste; agrupa las colas hasta que el esperado sea >= 5
+gof <- function(X, m) {
+  J <- length(X); ph <- mean(X) / m
+  obs <- tabulate(X + 1, nbins = m + 1); esp <- J * dbinom(0:m, m, ph)
+  lo <- 1;     while (sum(esp[1:lo]) < 5) lo <- lo + 1
+  hi <- m + 1; while (sum(esp[hi:(m + 1)]) < 5) hi <- hi - 1
+  mid <- if (lo + 1 <= hi - 1) (lo + 1):(hi - 1) else integer(0)
+  O <- c(sum(obs[1:lo]), obs[mid], sum(obs[hi:(m + 1)]))
+  E <- c(sum(esp[1:lo]), esp[mid], sum(esp[hi:(m + 1)]))
+  chi2 <- sum((O - E)^2 / E); gl <- length(O) - 2         # -1 por p estimada
+  c(grupos = J, p_hat = ph, chi2 = chi2, gl = gl,
+    p_valor = if (gl > 0) pchisq(chi2, gl, lower.tail = FALSE) else NA)
+}
+
+M <- 50
+XB <- grupos(bog, M); XU <- grupos(usm, M); XK <- grupos(ken, M)
+data.frame(k = 0:6, observado = tabulate(XU + 1, nbins = 7),
+           esperado = round(length(XU) * dbinom(0:6, M, mean(XU) / M), 1))   # Usme
+rbind(Bogota = gof(XB, M), Usme = gof(XU, M), Kennedy = gof(XK, M))
+```
+
+Bogotá `chi2 = 2,69`, `gl = 3`, `p = 0,44`; Usme `p = 0,66`; Kennedy `p = 0,42`. **Observado y esperado
+coinciden.**
+
+```{r fig.width=8, fig.height=4}
+barplot(rbind(tabulate(XU + 1, nbins = 8), length(XU) * dbinom(0:7, M, mean(XU) / M)),
+        beside = TRUE, names.arg = 0:7, col = c("#2a78d6", "#eb6834"), border = NA,
+        legend.text = c("Observado", "Binomial esperada"), args.legend = list(bty = "n"),
+        xlab = "Siniestros con muertos en el grupo de 50 (Usme)", ylab = "Grupos")
+```
+
+## Supuesto 4 · Sin sobredispersión
+
+```{r}
+dispersion <- function(X, m) {
+  J <- length(X); ph <- mean(X) / m; vb <- m * ph * (1 - ph)
+  D <- (J - 1) * var(X) / vb                                 # ~ chi2(J - 1) si es binomial
+  c(var_observada = var(X), var_binomial = vb, razon = var(X) / vb,
+    p_valor = 2 * min(pchisq(D, J - 1), pchisq(D, J - 1, lower.tail = FALSE)))
+}
+rbind(Bogota = dispersion(XB, M), Usme = dispersion(XU, M), Kennedy = dispersion(XK, M))
+```
+
+Razones de 1,05 (Bogotá), 0,73 (Usme) y 1,15 (Kennedy), ninguna significativa (`p` = 0,14; 0,24;
+0,15). Kennedy muestra una leve sobredispersión que hay que mencionar.
+
+## Robustez al tamaño del grupo
+
+```{r}
+rob <- function(dd) t(sapply(c(25, 50, 100), function(m) {
+  X <- grupos(dd, m); c(m = m, gof(X, m)[c("grupos", "chi2", "gl", "p_valor")], dispersion(X, m)[c("razon", "p_valor")])
+}))
+rob(bog); rob(usm); rob(ken)
+```
+
+Con grupos de 25, 50 y 100 el ajuste se mantiene en Bogotá y Usme. En Kennedy con grupos de 25 la
+prueba rechaza (`p = 0,02`, razón 1,18): siniestros graves algo agrupados en el tiempo. Con 50 y 100 no.
+
+---
+
+# La prior: lo que enseña la historia de la ciudad
+
+La prior se construye con 2015–2017, antes de los datos que se van a analizar. No se toma la
+tasa de la ciudad con el peso de 101.500 siniestros (eso aplastaría a cualquier localidad), sino
+cuánto varían las localidades entre sí: una Beta con la media y la varianza de las 19 tasas
+históricas (método de los momentos), descontando la parte de la varianza que es solo azar binomial.
+
+```{r}
+th <- hist %>% filter(CODIGO_LOCALIDAD != 20) %>%
+  group_by(CODIGO_LOCALIDAD) %>% summarise(n = n(), y = sum(y), p = y / n, .groups = "drop")
+m_h    <- sum(th$y) / sum(th$n)                         # media historica (1,61 %)
+v_obs  <- sum((th$p - m_h)^2) / (nrow(th) - 1)          # varianza entre localidades
+v_bin  <- mean(m_h * (1 - m_h) / th$n)                  # parte que es solo azar
+peso   <- m_h * (1 - m_h) / (v_obs - v_bin) - 1         # siniestros imaginarios
+aH <- m_h * peso; bH <- (1 - m_h) * peso
+c(media = m_h, peso = peso, a = aH, b = bH, li = qbeta(0.025, aH, bH), ls = qbeta(0.975, aH, bH))
+```
+
+La prior es Beta(4,60; 281,29): media 1,61 %, pesa como 286 siniestros y dice que la tasa de una
+localidad cualquiera está, con 95 % de probabilidad, entre 0,50 % y 3,36 %.
+
+# MODELO · Beta–Binomial por localidad
+
+`p | datos ~ Beta(a + y, b + n − y)`
+
+```{r}
+resumen <- function(a, b) c(a = a, b = b, media = a / (a + b),
+  li = qbeta(0.025, a, b), ls = qbeta(0.975, a, b), p_mayor_p0 = 1 - pbeta(p0, a, b))
+
+# factor de Bayes de H0: p = p0 frente a H1: p ~ Beta(a, b)
+bf01 <- function(y, n, a, b) exp(y * log(p0) + (n - y) * log(1 - p0) -
+                                 (lbeta(a + y, b + n - y) - lbeta(a, b)))
+
+yU <- sum(usm$y); nU <- nrow(usm); yK <- sum(ken$y); nK <- nrow(ken)
+rbind(Usme_prior   = resumen(aH, bH),
+      Usme_post    = resumen(aH + yU, bH + nU - yU),
+      Kennedy_post = resumen(aH + yK, bH + nK - yK))
+c(BF01_Usme = bf01(yU, nU, aH, bH), BF01_Kennedy = bf01(yK, nK, aH, bH))
+```
+
+**Usme:** posterior Beta(66,6; 2.030,3), media 3,18 %, intervalo del 95 % [2,47 %; 3,97 %]. El
+intervalo no contiene a p₀ = 1,40 %, P(p > p₀ | datos) ≈ 1 y el factor de Bayes BF₀₁ = 9 × 10⁻⁸: los
+datos son unas diez millones de veces más compatibles con H₁. Se rechaza H₀: en Usme un siniestro
+es más del doble de mortal que en Bogotá.**
+
+**Kennedy:** media 1,50 %, intervalo [1,28 %; 1,75 %], que sí contiene a p₀. BF₀₁ = 4,2 a favor de
+H₀: Kennedy tiene muchos muertos porque tiene muchos siniestros, no porque sean más mortales.
+
+```{r fig.width=9, fig.height=4}
+curve(dbeta(x, aH, bH), from = 0, to = 0.06, n = 1000, lwd = 2, lty = 2, col = "gray50",
+      ylim = c(0, 110), xlab = "p = P(siniestro con muertos)", ylab = "Densidad")
+curve(dbeta(x, aH + yU, bH + nU - yU), add = TRUE, n = 1000, lwd = 2, col = "#eb6834")
+abline(v = p0, lty = 3)
+legend("topright", c("Prior histórica", "Posterior Usme"), col = c("gray50", "#eb6834"),
+       lty = c(2, 1), lwd = 2, bty = "n")
+```
+
+## Cómo leer la prueba de hipótesis bayesiana
+
+Con una prior continua, $P(p = p_0 \mid \text{datos}) = 0$ siempre: la hipótesis puntual $H_0: p = p_0$ no se puede "probar" mirando solo la posterior. Por eso se reportan **tres criterios juntos**, cada uno responde algo distinto:
+
+| Criterio | Qué responde | Cómo se calcula |
+|---|---|---|
+| $P(p > p_0 \mid \text{datos})$ | ¿Qué tan probable es que la localidad sea *más* mortal que Bogotá? | `1 - pbeta(p0, a, b)` |
+| ROPE (región de equivalencia práctica) | ¿Cuánta de la posterior cae en "diferencia práctica nula" alrededor de $p_0$? | masa en $p_0 \pm 0{,}25$ pp |
+| Factor de Bayes $BF_{01}$ | ¿Qué tan probables son los datos si $p = p_0$ frente a si $p \sim$ Beta$(a,b)$? | cociente de marginales |
+
+El ancho del ROPE (±0,25 pp) es un **supuesto de quien analiza**: cambia $P(\text{ROPE})$, no $P(p>p_0\mid\text{datos})$.
+
+```{r rope}
+ROPE <- 0.0025
+rope_p <- function(a, b) pbeta(p0 + ROPE, a, b) - pbeta(p0 - ROPE, a, b)
+data.frame(localidad = c("Usme", "Kennedy"),
+           media = c((aH + yU) / (aH + bH + nU), (aH + yK) / (aH + bH + nK)),
+           P_mayor_p0 = c(1 - pbeta(p0, aH + yU, bH + nU - yU), 1 - pbeta(p0, aH + yK, bH + nK - yK)),
+           P_ROPE = c(rope_p(aH + yU, bH + nU - yU), rope_p(aH + yK, bH + nK - yK)),
+           BF01 = c(bf01(yU, nU, aH, bH), bf01(yK, nK, aH, bH)))
+```
+
+En Usme, la posterior queda **fuera** del ROPE (masa casi nula) y $P(p>p_0)\approx 1$. En Kennedy, casi toda la posterior cae dentro del ROPE: es **práctica y estadísticamente compatible** con la ciudad.
+
+### Una advertencia sobre el factor de Bayes (paradoja de Lindley–Jeffreys)
+
+El $BF_{01}$ depende mucho de la prior de $H_1$. Si $H_1$ reparte su probabilidad en un rango muy amplio (una prior difusa), asigna poca densidad a los valores cercanos a $p_0$ y **se "castiga" por ser vaga**: el $BF_{01}$ favorece a $H_0$ aunque la diferencia sea real. Para verlo, se barre el **peso** $m = a + b$ de una prior con la misma media histórica (1,61 %):
+
+```{r lindley, fig.width=8, fig.height=4.5}
+ms <- 10^seq(log10(2), 5, length.out = 100)
+barr <- do.call(rbind, lapply(c(Usme = "Usme", Kennedy = "Kennedy"), function(nm) {
+  y_ <- if (nm == "Usme") yU else yK; n_ <- if (nm == "Usme") nU else nK
+  data.frame(localidad = nm, m = ms,
+             BF01 = sapply(ms, function(m) bf01(y_, n_, m_h * m, (1 - m_h) * m)),
+             P_mayor = sapply(ms, function(m) 1 - pbeta(p0, m_h * m + y_, (1 - m_h) * m + n_ - y_)))
+}))
+ggplot(barr, aes(m, BF01, colour = localidad)) + geom_line(linewidth = 0.9) +
+  geom_hline(yintercept = 1, linetype = "dotted") + geom_vline(xintercept = peso, linetype = "dashed", colour = "gray40") +
+  scale_x_log10() + scale_y_log10() + scale_colour_manual(values = c(Usme = "#eb6834", Kennedy = "#2a78d6"), name = NULL) +
+  labs(x = "Peso de la prior m = a + b (siniestros imaginarios, escala log)", y = "BF01 (escala log)",
+       caption = "Línea discontinua: peso histórico (286). BF01 > 1 favorece H0; < 1 favorece H1.") +
+  theme_minimal()
+barr %>% filter(m %in% ms[c(1, 25, 50, 75, 100)]) %>% mutate(across(c(BF01, P_mayor), ~ signif(.x, 3)))
+```
+
+**Lectura.** En **Usme**, el $BF_{01}$ está por debajo de 1 con *cualquier* peso de prior: la conclusión no depende de la prior elegida. En **Kennedy**, el $BF_{01}$ sube cuanto más difusa es la prior: con la histórica vale `r signif(bf01(yK, nK, aH, bH), 2)`, pero con una prior casi uniforme (peso 2) vale `r signif(bf01(yK, nK, m_h * 2, (1 - m_h) * 2), 2)`. Ese "apoyo fuerte a $H_0$" es en buena parte un artefacto de la vaguedad de la prior, no evidencia fuerte de igualdad. Por eso conviene apoyarse además en el intervalo de credibilidad y el ROPE, que no sufren este problema: ambos dicen lo mismo para Kennedy (compatible con la ciudad) sin depender del peso de la prior.
+
+## Las 19 localidades
+
+```{r}
+tab <- rec %>% group_by(CODIGO_LOCALIDAD, localidad) %>% summarise(n = n(), y = sum(y), .groups = "drop") %>%
+  rowwise() %>%
+  mutate(a = aH + y, b = bH + n - y, media = a / (a + b),
+         li = qbeta(0.025, a, b), ls = qbeta(0.975, a, b),
+         p_mayor_p0 = 1 - pbeta(p0, a, b), BF01 = bf01(y, n, aH, bH),
+         P_H0 = BF01 / (1 + BF01)) %>% ungroup() %>% arrange(desc(media))
+tab %>% mutate(across(c(media, li, ls), ~ round(100 * .x, 2)), across(c(p_mayor_p0, BF01, P_H0), ~ signif(.x, 3)))
+
+ggplot(tab %>% filter(CODIGO_LOCALIDAD != 20),
+       aes(media, reorder(localidad, media),
+           color = ifelse(li > p0, "Por encima", ifelse(ls < p0, "Por debajo", "Compatible")))) +
+  geom_vline(xintercept = p0, linetype = "dotted") +
+  geom_errorbarh(aes(xmin = li, xmax = ls), height = 0) + geom_point(size = 2) +
+  scale_color_manual(values = c(`Por encima` = "#eb6834", `Compatible` = "gray55", `Por debajo` = "#2a78d6"), name = NULL) +
+  scale_x_continuous(labels = scales::percent) + labs(x = "Media posterior e IC 95 %", y = NULL) + theme_minimal()
+```
+
+Por encima de Bogotá: **Usme, Ciudad Bolívar y Rafael Uribe Uribe**. Por debajo: Usaquén, Chapinero,
+Barrios Unidos y Teusaquillo. Las otras 12 son compatibles con la ciudad.
+
+## Usme contra el resto de la ciudad
+
+```{r}
+resto <- rec %>% filter(CODIGO_LOCALIDAD != 5); yR <- sum(resto$y); nR <- nrow(resto)
+set.seed(2026)
+sU <- rbeta(200000, aH + yU, bH + nU - yU); sR <- rbeta(200000, 1 + yR, 1 + nR - yR)
+c(prob_usme_mayor = mean(sU > sR), dif_media = mean(sU - sR), quantile(sU - sR, c(0.025, 0.975)),
+  razon_media = mean(sU / sR), quantile(sU / sR, c(0.025, 0.975)))
+```
+
+En Usme un siniestro deja muertos 1,8 puntos porcentuales más que en el resto de la ciudad (entre 1,1
+y 2,6). Dicho como razón: es 2,3 veces más mortal (entre 1,8 y 2,9).
+
+# La cuarentena de 2020
+
+```{r}
+yN <- sum(rec$y); nN <- nrow(rec); yC <- sum(cua$y); nC <- nrow(cua)
+aN <- 1 + yN; bN <- 1 + nN - yN; aC <- 1 + yC; bC <- 1 + nC - yC
+rbind(normal = resumen(aN, bN), cuarentena = resumen(aC, bC))
+
+set.seed(2026)
+sN <- rbeta(200000, aN, bN); sC <- rbeta(200000, aC, bC)
+c(prob_cua_mayor = mean(sC > sN), dif_media = mean(sC - sN), quantile(sC - sN, c(0.025, 0.975)),
+  razon_media = mean(sC / sN), quantile(sC / sN, c(0.025, 0.975)))
+```
+
+Normal: media 1,40 % [1,33 %; 1,48 %]. Cuarentena: media 1,90 % [1,59 %; 2,24 %].
+P(p cuarentena > p normal | datos) = 0,999. En cuarentena un siniestro fue 36 % más mortal (razón
+1,36, entre 1,12 y 1,61): con calles vacías hubo menos siniestros, pero más graves.
+
+```{r fig.width=8, fig.height=4}
+curve(dbeta(x, aN, bN), from = 0.008, to = 0.028, n = 1000, lwd = 2, col = "#2a78d6",
+      xlab = "p = P(siniestro con muertos)", ylab = "Densidad")
+curve(dbeta(x, aC, bC), add = TRUE, n = 1000, lwd = 2, col = "#eb6834")
+legend("topright", c("Normal 2018–2020", "Cuarentena 2020"), col = c("#2a78d6", "#eb6834"), lwd = 2, bty = "n")
+```
+
+# Sensibilidad a la prior
+
+Una prior Beta(a, b) funciona como siniestros imaginarios: *a* con muertos y *b* sin muertos que "ya se
+habían visto". Pesa como a + b siniestros. Con muchos datos se diluye; con pocos, manda.
+
+## Por localidad: cuatro priors
+
+- **Uniforme** y **Jeffreys**: dos formas estándar de decir "no sé nada".
+- **Histórica (principal)**: la de la sección anterior, 286 siniestros imaginarios.
+- **Escéptica**: cree que la localidad es igual a Bogotá (p₀) con tanto peso como sus propios datos.
+
+```{r}
+sens_loc <- function(cod) {
+  dd <- rec %>% filter(CODIGO_LOCALIDAD == cod); y <- sum(dd$y); n <- nrow(dd)
+  pr <- list(uniforme = c(1, 1), jeffreys = c(0.5, 0.5), historica = c(aH, bH),
+             esceptica = c(1 + n * p0, 1 + n * (1 - p0)))
+  t(sapply(pr, function(ab) c(peso = sum(ab), datos = n,
+                              resumen(ab[1] + y, ab[2] + n - y)[c("media", "li", "ls", "p_mayor_p0")])))
+}
+sens_loc(5)    # Usme, 1.811 siniestros
+sens_loc(8)    # Kennedy, 9.793
+sens_loc(17)   # La Candelaria, 407
+sens_loc(20)   # Sumapaz, 6
+```
+
+- **Usme y Kennedy:** la conclusión no cambia con ninguna prior. Usme queda por encima de p₀ incluso
+  con la escéptica (media 2,44 %, intervalo [1,96 %; 2,97 %]).
+- **La Candelaria (407 siniestros, 5 con muertos):** la media va de 1,35 % a 1,47 %, pero todas
+  concluyen lo mismo: no se distingue de la ciudad.
+- **Sumapaz (6 siniestros, 3 con muertos):** con la uniforme la media es 50 %; con la histórica,
+  2,6 %. **Aquí la prior lo decide todo**: seis siniestros no alcanzan para decir nada por sí solos.
+
+## Cuarentena: como la temporada sin público
+
+Tres opiniones de partida antes de ver la cuarentena: uniforme, y dos que creen que la cuarentena será
+normal (1,40 %), con el peso de media cuarentena y de una cuarentena completa.
+
+```{r}
+m0 <- aN / (aN + bN)
+prior_hist <- function(peso) c(1 + peso * m0, 1 + peso * (1 - m0))
+priors <- list(uniforme = c(1, 1), media_cuarentena = prior_hist(round(nC / 2)), una_cuarentena = prior_hist(nC))
+t(sapply(priors, function(ab) {
+  a <- ab[1] + yC; b <- ab[2] + nC - yC
+  c(prior_a = ab[1], prior_b = ab[2], prior_media = ab[1] / sum(ab),
+    resumen(a, b)[c("media", "li", "ls")], p_mayor_normal = 1 - pbeta(m0, a, b))
+}))
+```
+
+No depende de la prior que la cuarentena fue más mortal: aun quien arranca convencido de que sería
+normal, con el peso de 6.725 siniestros, termina con media 1,65 % e intervalo [1,45 %; 1,88 %], que no
+toca la media normal (1,40 %). P(p > normal) va de 0,991 a 0,999.
+
+# Validación predictiva
+
+Se ajusta el modelo **sin** el periodo que se quiere predecir (2018–2019) y se compara con lo
+observado. La predictiva posterior es una Beta–Binomial.
+
+```{r}
+pred_bb <- function(nn, a, b) {
+  k <- 0:nn
+  pr <- exp(lchoose(nn, k) + lbeta(k + a, nn - k + b) - lbeta(a, b)); pr / sum(pr)
+}
+valida <- function(ent, obj, a0 = 1, b0 = 1) {
+  a <- a0 + sum(ent$y); b <- b0 + nrow(ent) - sum(ent$y)
+  nn <- nrow(obj); yo <- sum(obj$y); pr <- pred_bb(nn, a, b); cdf <- cumsum(pr)
+  c(n = nn, observado = yo, esperado = sum((0:nn) * pr),
+    li = min(which(cdf >= 0.025)) - 1, ls = min(which(cdf >= 0.975)) - 1,
+    p_cola_superior = sum(pr[(yo + 1):(nn + 1)]))
+}
+ent <- rec %>% filter(anio <= 2019)
+rbind(`Bogota 2020 normal` = valida(ent, rec %>% filter(anio == 2020)),
+      `Bogota cuarentena`  = valida(ent, cua),
+      `Usme 2020 normal`   = valida(ent %>% filter(CODIGO_LOCALIDAD == 5),
+                                    rec %>% filter(anio == 2020, CODIGO_LOCALIDAD == 5), aH, bH),
+      `Kennedy 2020 normal` = valida(ent %>% filter(CODIGO_LOCALIDAD == 8),
+                                     rec %>% filter(anio == 2020, CODIGO_LOCALIDAD == 8), aH, bH))
+```
+
+2020 sin cuarentena queda dentro del rango del 95 % en Bogotá (242 en [189; 253]), Usme (11 en [6; 21]) y
+Kennedy (35 en [16; 38]). La cuarentena queda muy por fuera: 127 frente a [74; 113]; si hubiera sido un
+periodo normal, ver 127 o más tendría probabilidad 0,0007.
+
+---
+
+# MODELO 2 · Gamma–Poisson: siniestros con muertos por día
+
+Ahora la variable es cuántos siniestros con muertos hay en un día. Si siguen una Poisson(λ) y la
+prior de λ es Gamma(α, β), la posterior es Gamma(α + total, β + días).
+
+```{r}
+conteo <- function(dd, dias) as.integer(table(factor(as.character(dd$fecha[dd$y == 1]), levels = as.character(dias))))
+dias_cua  <- seq(as.Date("2020-03-25"), as.Date("2020-08-31"), by = "day")
+dias_rec  <- setdiff(seq(as.Date("2018-01-01"), as.Date("2020-12-31"), by = "day"), dias_cua)
+dias_rec  <- as.Date(dias_rec, origin = "1970-01-01")
+dias_hist <- seq(as.Date("2015-01-01"), as.Date("2017-12-31"), by = "day")
+cN <- conteo(rec, dias_rec); cC <- conteo(cua, dias_cua); cH <- conteo(hist, dias_hist)
+cU <- conteo(usm, dias_rec); cHU <- conteo(hist %>% filter(CODIGO_LOCALIDAD == 5), dias_hist)
+c(dias_normales = length(cN), lambda_normal = mean(cN), dias_cuarentena = length(cC), lambda_cua = mean(cC))
+```
+
+## ¿Es Poisson? Bondad de ajuste e índice de dispersión
+
+```{r}
+gof_pois <- function(X) {
+  J <- length(X); lam <- mean(X); kmax <- max(X)
+  obs <- tabulate(X + 1, nbins = kmax + 1); esp <- J * dpois(0:kmax, lam)
+  esp[kmax + 1] <- esp[kmax + 1] + J * ppois(kmax, lam, lower.tail = FALSE)
+  hi <- kmax + 1; while (sum(esp[hi:(kmax + 1)]) < 5) hi <- hi - 1
+  O <- c(obs[seq_len(hi - 1)], sum(obs[hi:(kmax + 1)])); E <- c(esp[seq_len(hi - 1)], sum(esp[hi:(kmax + 1)]))
+  chi2 <- sum((O - E)^2 / E); gl <- length(O) - 2
+  D <- (J - 1) * var(X) / lam
+  c(dias = J, lambda = lam, varianza = var(X), indice = var(X) / lam, chi2 = chi2, gl = gl,
+    p_valor = if (gl > 0) pchisq(chi2, gl, lower.tail = FALSE) else NA,
+    p_dispersion = 2 * min(pchisq(D, J - 1), pchisq(D, J - 1, lower.tail = FALSE)))
+}
+rbind(normal = gof_pois(cN), cuarentena = gof_pois(cC), usme = gof_pois(cU), historico = gof_pois(cH))
+tapply(cN, weekdays(dias_rec), mean)     # efecto del dia de la semana
+```
+
+Días normales: `chi2 = 1,58`, `gl = 4`, `p = 0,81`, índice de dispersión 1,05 (`p = 0,31`): **el conteo
+diario es Poisson.** En la cuarentena el ajuste es peor (`p = 0,036`) y hay subdispersión (índice
+0,78): hubo menos días con 0 y menos con 3 o más de lo que espera la Poisson. Se reporta como
+limitación. Viernes y sábados tienen más siniestros con muertos (1,50 y 1,64 por día) que los domingos
+(1,13).
+
+## Posterior de λ
+
+```{r}
+g0 <- c(0.001, 0.001)                                        # Gamma vaga
+gpost <- function(X, a0 = g0[1], b0 = g0[2]) c(a0 + sum(X), b0 + length(X))
+gres  <- function(ab) c(a = ab[1], b = ab[2], media = ab[1] / ab[2],
+                        li = qgamma(0.025, ab[1], ab[2]), ls = qgamma(0.975, ab[1], ab[2]))
+GN <- gpost(cN); GC <- gpost(cC); GU <- gpost(cU)
+rbind(normal = gres(GN), cuarentena = gres(GC), usme = gres(GU))
+
+set.seed(2026)
+lN <- rgamma(200000, GN[1], GN[2]); lC <- rgamma(200000, GC[1], GC[2])
+c(prob_cua_menor = mean(lC < lN), dif = mean(lN - lC), quantile(lN - lC, c(0.025, 0.975)))
+```
+
+Normal: 1,32 siniestros con muertos por día [1,25; 1,39]. Cuarentena: 0,79 [0,66; 0,94]. Usme:
+0,066 por día (uno cada 15 días). La cuarentena tuvo menos siniestros fatales por día
+(0,52 menos, entre 0,36 y 0,68) aunque cada siniestro fuera más mortal: las dos cosas pasan a la vez
+porque el número total de siniestros cayó mucho más.
+
+## Priors no informativas e informativas para λ
+
+```{r}
+sens_g <- function(X, lam_hist) {
+  pr <- list(vaga = c(0.001, 0.001), jeffreys = c(0.5, 0), historica_30_dias = c(lam_hist * 30, 30),
+             historica_peso_datos = c(lam_hist * length(X), length(X)))
+  t(sapply(pr, function(ab) c(prior_a = ab[1], prior_b = ab[2], gres(ab + c(sum(X), length(X)))[c("media", "li", "ls")])))
+}
+sens_g(cC, mean(cH))      # cuarentena, prior historica de Bogota (1,49 por dia)
+sens_g(cU, mean(cHU))     # Usme, prior historica de Usme
+```
+
+Con 160 días la prior histórica de peso 30 días sube la media de la cuarentena de 0,79 a 0,90; con el
+peso de los 160 días, a 1,14. Aun así queda por debajo de 1,32. En Usme (936 días) la prior casi no
+importa salvo cuando pesa tanto como los datos.
+
+## Predictiva posterior: Binomial Negativa
+
+```{r}
+# un dia: NB(a, b / (b + 1)); una semana: NB(a, b / (b + 7))
+pred_dia <- function(G) c(dnbinom(0:2, G[1], G[2] / (G[2] + 1)), `3+` = pnbinom(2, G[1], G[2] / (G[2] + 1), lower.tail = FALSE))
+rbind(normal = pred_dia(GN), cuarentena = pred_dia(GC))
+c(dnbinom(0:2, GU[1], GU[2] / (GU[2] + 7)), `3+` = pnbinom(2, GU[1], GU[2] / (GU[2] + 7), lower.tail = FALSE))  # Usme, semana
+
+# chequeos predictivos: simular anios completos y comparar con lo observado
+set.seed(2026); S <- 4000
+lam_s <- rgamma(S, GN[1], GN[2])
+sim <- matrix(rpois(S * 365, rep(lam_s, each = 365)), nrow = S, byrow = TRUE)
+est <- function(X) c(pct_cero = mean(X == 0), pct_3mas = mean(X >= 3), maximo = max(X), varianza = var(X))
+obs <- est(cN); ss <- t(apply(sim, 1, est))
+rbind(observado = obs, sim_media = colMeans(ss),
+      sim_li = apply(ss, 2, quantile, 0.025), sim_ls = apply(ss, 2, quantile, 0.975),
+      p_bayes = colMeans(sweep(ss, 2, obs, ">=")))
+quantile(rowSums(sim), c(0.025, 0.5, 0.975))     # total de un anio; 2019 tuvo 492
+```
+
+Un día normal en Bogotá: 27 % sin siniestros con muertos, 35 % con uno, 23 % con dos y 15 % con tres o
+más. En cuarentena, 45 % de los días sin ninguno. En Usme, una semana sin siniestros fatales tiene
+probabilidad 0,63. El modelo reproduce el porcentaje de días en cero (26 % frente a 27 %) y de días con
+3 o más (14 % frente a 15 %). Lo que no reproduce es el día más malo: hubo un día con 8 y el modelo
+espera como máximo 5 a 7 (`p = 0,025`). Para un año completo predice entre 431 y 532 siniestros
+con muertos; 2019 tuvo 492.
+
+# Intervalos de credibilidad: colas iguales frente a HPD
+
+```{r}
+hpd <- function(qf, mass = 0.95) {
+  f <- function(q) qf(q + mass) - qf(q)
+  q <- optimize(f, c(0, 1 - mass))$minimum
+  c(hpd_li = qf(q), hpd_ls = qf(q + mass))
+}
+casos <- list(
+  p_usme       = function(q) qbeta(q, aH + yU, bH + nU - yU),
+  p_cuarentena = function(q) qbeta(q, aC, bC),
+  p_candelaria = function(q) qbeta(q, 1 + 5, 1 + 402),
+  p_sumapaz    = function(q) qbeta(q, 1 + 3, 1 + 3),
+  l_normal     = function(q) qgamma(q, GN[1], GN[2]),
+  l_cuarentena = function(q) qgamma(q, GC[1], GC[2]),
+  l_usme       = function(q) qgamma(q, GU[1], GU[2]))
+t(sapply(casos, function(qf) { h <- hpd(qf); ci <- qf(c(0.025, 0.975))
+  c(ci_li = ci[1], ci_ls = ci[2], h, reduccion_pct = 100 * (1 - diff(h) / diff(ci))) }))
+```
+
+Con posteriores casi simétricas (Usme, Bogotá, λ) los dos intervalos prácticamente coinciden: el HPD es
+menos del 0,4 % más angosto. Donde se nota es en La Candelaria (5 de 407): la posterior es asimétrica y
+el HPD es 3,7 % más angosto y se corre hacia la izquierda ([0,43 %; 2,65 %] frente a [0,54 %; 2,84 %]).
+En Sumapaz la posterior Beta(4, 4) es simétrica y los dos coinciden exactamente.
+
+# Teoría de la decisión: cinco funciones de pérdida
+
+El decisor es la Secretaría de Movilidad. Subestimar la mortalidad de una localidad (y no
+intervenir) cuesta más que sobreestimarla: k₁ = 3 por subestimar y k₂ = 1 por sobreestimar. La LINEX
+con a < 0 también castiga más la subestimación.
+
+```{r}
+K1 <- 3; K2 <- 1
+bayes_beta <- function(a, b, aL) {
+  E <- integrate(function(t) exp(-aL * t) * dbeta(t, a, b),
+                 qbeta(1e-12, a, b), qbeta(1 - 1e-12, a, b))$value   # donde esta la masa
+  c(cuadratica = a / (a + b), cuad_relativa = (a - 2) / (a + b - 2),
+    lineal_asim = qbeta(K1 / (K1 + K2), a, b), todo_nada = (a - 1) / (a + b - 2), linex = -log(E) / aL)
+}
+bayes_gamma <- function(a, b, aL) c(cuadratica = a / b, cuad_relativa = (a - 2) / b,
+  lineal_asim = qgamma(K1 / (K1 + K2), a, b), todo_nada = (a - 1) / b, linex = (a / aL) * log(1 + aL / b))
+
+A_P <- -200; A_L <- -20
+est <- rbind(
+  p_usme       = bayes_beta(aH + yU, bH + nU - yU, A_P),
+  p_kennedy    = bayes_beta(aH + yK, bH + nK - yK, A_P),
+  p_candelaria = bayes_beta(aH + 5, bH + 402, A_P),
+  p_cuarentena = bayes_beta(aC, bC, A_P),
+  l_normal     = bayes_gamma(GN[1], GN[2], A_L),
+  l_cuarentena = bayes_gamma(GC[1], GC[2], A_L),
+  l_usme       = bayes_gamma(GU[1], GU[2], A_L))
+cbind(est, rango_relativo = (apply(est, 1, max) - apply(est, 1, min)) / est[, "cuadratica"])
+sapply(c(-50, -200, -500), function(aL) bayes_beta(aH + yU, bH + nU - yU, aL)["linex"])   # Usme, varios a
+```
+
+En Usme las cinco estimaciones van de 3,08 % (cuadrática relativa) a 3,43 % (lineal asimétrica): un
+rango del 11 % de la media. En Kennedy y en λ normal, del 7 % y 2 %. En La Candelaria, con pocos datos,
+van de 1,10 % a 1,65 %: un rango del 40 %, y las que más se alejan son la lineal asimétrica y la
+LINEX, como anticipaba H5.
+
+## Cada estimador es óptimo bajo *su* pérdida
+
+Las cinco funciones de pérdida son $L(d,p)$: cuadrática $(d-p)^2$; cuadrática relativa $(d-p)^2/p^2$; lineal asimétrica ($k_1 = 3$ si $d<p$, $k_2 = 1$ si $d>p$); todo o nada ($\varepsilon = 0{,}0005$, es decir 0,05 pp) y LINEX con $a = -200$. La tabla cruza los cinco estimadores de Bayes de $p_{\text{Usme}}$ (filas) con las cinco pérdidas (columnas): cada celda es la **pérdida esperada posterior dividida por la mínima de su columna** (1,00 = óptimo bajo esa pérdida).
+
+```{r cruce-perdidas}
+eps_tn <- 0.0005
+perd_esp <- function(d, a, b, tipo) {                    # E[L(d, p) | datos] con p ~ Beta(a, b)
+  if (tipo == "todo") return(1 - (pbeta(d + eps_tn, a, b) - pbeta(d - eps_tn, a, b)))
+  f <- switch(tipo,
+    cuad  = function(t) (d - t)^2,
+    rel   = function(t) (d - t)^2 / t^2,
+    lin   = function(t) ifelse(d > t, K2 * (d - t), K1 * (t - d)),
+    linex = function(t) exp(A_P * (d - t)) - A_P * (d - t) - 1)
+  integrate(function(t) f(t) * dbeta(t, a, b), qbeta(1e-12, a, b), qbeta(1 - 1e-12, a, b),
+            subdivisions = 500, rel.tol = 1e-8)$value
+}
+aU <- aH + yU; bU <- bH + nU - yU
+d_est <- est["p_usme", ]                                  # los cinco estimadores de Bayes para Usme
+tipos <- c(cuad = "cuad", rel = "rel", lin = "lin", todo = "todo", linex = "linex")
+Mx <- sapply(tipos, function(tp) sapply(d_est, function(d) perd_esp(d, aU, bU, tp)))
+rownames(Mx) <- names(d_est)
+round(sweep(Mx, 2, apply(Mx, 2, min), "/"), 3)
+```
+
+La diagonal vale ≈ 1,000: **cada estimador es el mejor bajo su propia pérdida** Fuera de la diagonal, usar el estimador "equivocado" cuesta entre poco y bastante, según la pérdida del decisor: por ejemplo, reportar la media cuando el decisor penaliza más subestimar tiene una pérdida esperada `r round(100 * (Mx["cuadratica", "lin"] / Mx["lineal_asim", "lin"] - 1))` % mayor que reportar el cuantil 0,75. Esto es lo que da sentido a H5: **qué se reporta depende de cuánto cuesta equivocarse y en qué dirección**.
+
+## ¿Intervenir una localidad?
+
+Se interviene si la probabilidad de que la localidad sea de alto riesgo (p > 1,5 · p₀ = 2,1 %)
+supera c₁ / (c₁ + c₂). Si intervenir sin necesidad cuesta c₁ = 1 y no intervenir cuando hacía falta
+cuesta c₂ = 3, el umbral es 0,25.
+
+```{r}
+C1 <- 1; C2 <- 3
+tab %>% mutate(p_alto = 1 - pbeta(1.5 * p0, a, b), intervenir = p_alto > C1 / (C1 + C2)) %>%
+  select(localidad, n, y, media, p_alto, intervenir) %>% arrange(desc(p_alto))
+```
+
+Se intervienen Usme (0,999), Ciudad Bolívar (0,98) y Rafael Uribe Uribe (0,77). Sumapaz también
+pasa el umbral (0,68), pero con solo 6 siniestros esa decisión la toma casi entera la prior.
+
+# Verificación con JAGS
+
+JAGS aproxima la posterior por MCMC (muestreo de Gibbs). En modelos conjugados no hace falta, pero sirve para **comprobar que la teoría y el código coinciden**; después se usa en un modelo que **no** tiene forma cerrada (siguiente sección). Se usan 3 cadenas, 4.000 iteraciones de calentamiento y 40.000 de muestreo; se reporta $\hat R$ (≈ 1 indica convergencia) y el tamaño efectivo de muestra.
+
+```{r jags-funcion}
+correr_jags <- function(modelo, datos, nodos, n.adapt = 2000, burn = 4000, iter = 40000, chains = 3) {
+  m <- jags.model(textConnection(modelo), data = datos, n.chains = chains, n.adapt = n.adapt, quiet = TRUE)
+  update(m, burn, progress.bar = "none")
+  coda.samples(m, nodos, n.iter = iter, progress.bar = "none")
+}
+```
+
+## Beta–Binomial de Usme: JAGS frente a la posterior analítica
+
+```{r jags-bb}
+mod_bb <- "
+model {
+  y ~ dbin(p, n)
+  p ~ dbeta(a0, b0)
+}"
+jb <- correr_jags(mod_bb, list(y = yU, n = nU, a0 = aH, b0 = bH), "p")
+vb <- as.numeric(as.matrix(jb)); A_ <- aH + yU; B_ <- bH + nU - yU
+data.frame(fuente = c("Analítica", "JAGS"),
+           media = c(A_ / (A_ + B_), mean(vb)),
+           li = c(qbeta(0.025, A_, B_), quantile(vb, 0.025, names = FALSE)),
+           ls = c(qbeta(0.975, A_, B_), quantile(vb, 0.975, names = FALSE)),
+           P_mayor_p0 = c(1 - pbeta(p0, A_, B_), mean(vb > p0)),
+           Rhat = c(NA, gelman.diag(jb)$psrf[1, 1]),
+           n_efectivo = c(NA, effectiveSize(jb)))
+```
+
+## Gamma–Poisson: normal frente a cuarentena
+
+El modelo tiene dos tasas, $\lambda_N$ (días normales) y $\lambda_C$ (cuarentena), cada una con la prior Gamma vaga. JAGS también entrega la **diferencia** $\lambda_N - \lambda_C$ y una **predictiva de un día nuevo** en cuarentena, que se compara con la Binomial Negativa analítica.
+
+```{r jags-gp}
+mod_gp <- "
+model {
+  for (i in 1:nN) { cN[i] ~ dpois(lamN) }
+  for (i in 1:nC) { cC[i] ~ dpois(lamC) }
+  lamN ~ dgamma(0.001, 0.001)
+  lamC ~ dgamma(0.001, 0.001)
+  dif  <- lamN - lamC
+  ynuevo ~ dpois(lamC)
+}"
+jg <- correr_jags(mod_gp, list(cN = cN, nN = length(cN), cC = cC, nC = length(cC)), c("lamN", "lamC", "dif", "ynuevo"))
+mg <- as.matrix(jg)
+data.frame(cantidad = c("lambda normal (media)", "lambda cuarentena (media)", "lambda cuarentena IC95 inf.",
+                        "lambda cuarentena IC95 sup.", "diferencia normal - cuarentena (media)",
+                        "P(lambda cuarentena < normal)", "P(día nuevo en cuarentena sin siniestros fatales)"),
+           analitica = c(GN[1] / GN[2], GC[1] / GC[2], qgamma(0.025, GC[1], GC[2]), qgamma(0.975, GC[1], GC[2]),
+                         GN[1] / GN[2] - GC[1] / GC[2], mean(lC < lN),
+                         dnbinom(0, GC[1], GC[2] / (GC[2] + 1))),
+           JAGS = c(mean(mg[, "lamN"]), mean(mg[, "lamC"]), quantile(mg[, "lamC"], 0.025, names = FALSE),
+                    quantile(mg[, "lamC"], 0.975, names = FALSE), mean(mg[, "dif"]),
+                    mean(mg[, "lamC"] < mg[, "lamN"]), mean(mg[, "ynuevo"] == 0)))
+c(Rhat_lamN = unname(gelman.diag(jg[, "lamN"])$psrf[1, 1]), Rhat_lamC = unname(gelman.diag(jg[, "lamC"])$psrf[1, 1]))
+```
+
+**Lectura.** En ambos modelos JAGS reproduce la solución analítica (medias, intervalos, probabilidades y la predictiva coinciden a 2–3 cifras, con $\hat R \approx 1{,}00$ y decenas de miles de muestras efectivas). La implementación en R y la teoría son consistentes.
+
+# Extensión jerárquica: las 19 localidades a la vez
+
+La prior histórica usa la dispersión entre localidades de 2015–2017 para fijar su peso ($a+b \approx 286$) y lo trata como **conocido**. Un modelo **jerárquico** estima ese peso con los propios datos recientes y reparte la incertidumbre: cada localidad tiene su $p_j$, y todas comparten una distribución Beta con media $\mu$ y concentración $\kappa$ desconocidas (**encogimiento parcial**):
+
+$$y_j \mid p_j \sim \text{Bin}(n_j, p_j),\qquad p_j \sim \text{Beta}\big(\mu\kappa,\ (1-\mu)\kappa\big),\qquad \mu \sim \text{Beta}(1,1),\quad \kappa \sim \text{Gamma}(1;\,0{,}001).$$
+
+Se ajusta con los datos del periodo reciente (2018–2020 sin cuarentena) de las 19 localidades (sin Sumapaz). No tiene forma cerrada: es el tipo de modelo para el que se usa JAGS.
+
+```{r jags-jerarquico}
+dh <- rec %>% filter(CODIGO_LOCALIDAD != 20) %>% group_by(CODIGO_LOCALIDAD, localidad) %>%
+  summarise(n = n(), y = sum(y), .groups = "drop") %>% arrange(CODIGO_LOCALIDAD)
+mod_h <- "
+model {
+  for (j in 1:J) { y[j] ~ dbin(p[j], n[j]); p[j] ~ dbeta(mu * kappa, (1 - mu) * kappa) }
+  mu    ~ dbeta(1, 1)
+  kappa ~ dgamma(1, 0.001)
+}"
+jh <- correr_jags(mod_h, list(y = dh$y, n = dh$n, J = nrow(dh)), c("p", "mu", "kappa"), burn = 6000, iter = 60000)
+mh <- as.matrix(jh)
+pj <- mh[, paste0("p[", seq_len(nrow(dh)), "]")]
+kap <- mh[, "kappa"]
+c(Rhat_max_p = max(gelman.diag(jh[, grep("^p\\[", varnames(jh))])$psrf[, 1]),
+  Rhat_kappa = unname(gelman.diag(jh[, "kappa"])$psrf[1, 1]),
+  kappa_mediana = median(kap), kappa_li = quantile(kap, 0.025, names = FALSE), kappa_ls = quantile(kap, 0.975, names = FALSE),
+  mu_media = mean(mh[, "mu"]), peso_historico = peso)
+```
+
+La concentración estimada $\kappa$ tiene mediana `r round(median(kap))` (IC 95 %: `r round(quantile(kap, 0.025, names = FALSE))`–`r round(quantile(kap, 0.975, names = FALSE))`), frente al peso histórico de `r round(peso)` siniestros imaginarios: ambas rutas llevan a un nivel de encogimiento del mismo orden de magnitud.
+
+```{r jags-comparacion}
+comp <- dh %>% mutate(crudo = y / n,
+                      historica = (aH + y) / (aH + bH + n),
+                      jerarquico = colMeans(pj),
+                      jer_li = apply(pj, 2, quantile, 0.025), jer_ls = apply(pj, 2, quantile, 0.975),
+                      P_mayor_p0 = colMeans(pj > p0),
+                      P_es_la_mayor = tabulate(apply(pj, 1, which.max), nbins = nrow(dh)) / nrow(pj)) %>%
+  arrange(desc(jerarquico))
+comp %>% mutate(across(c(crudo, historica, jerarquico, jer_li, jer_ls), ~ round(100 * .x, 2)),
+                across(c(P_mayor_p0, P_es_la_mayor), ~ round(.x, 3))) %>%
+  select(localidad, n, y, crudo, historica, jerarquico, jer_li, jer_ls, P_mayor_p0, P_es_la_mayor)
+```
+
+```{r jags-grafico, fig.width=8, fig.height=5.5}
+ggplot(comp, aes(crudo, jerarquico, label = localidad)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  geom_hline(yintercept = mean(mh[, "mu"]), linetype = "dotted", colour = "gray50") +
+  geom_point(aes(colour = localidad == "Usme"), show.legend = FALSE) +
+  geom_text(size = 3, vjust = -0.8, check_overlap = TRUE) +
+  scale_colour_manual(values = c("gray35", "#eb6834")) +
+  scale_x_continuous(labels = scales::percent) + scale_y_continuous(labels = scales::percent) +
+  labs(x = "Proporción observada", y = "Media posterior jerárquica",
+       title = "Encogimiento parcial", subtitle = "Diagonal: sin encogimiento. Línea punteada: media global estimada") +
+  theme_minimal()
+```
+
+## Una elección hecha después de ver los datos
+
+Usme se escogió **porque tenía la mayor tasa observada**. Contrastar la localidad más extrema de las 19 exagera la evidencia (es la "maldición del ganador": parte de lo extremo es azar). El modelo jerárquico lo corrige de dos maneras:
+
+1. **Encoge** la estimación de Usme hacia el centro común: de `r round(100 * comp$crudo[comp$localidad == "Usme"], 2)` % observado a `r round(100 * comp$jerarquico[comp$localidad == "Usme"], 2)` % (IC 95 %: `r round(100 * comp$jer_li[comp$localidad == "Usme"], 2)`–`r round(100 * comp$jer_ls[comp$localidad == "Usme"], 2)` %), frente a `r round(100 * comp$historica[comp$localidad == "Usme"], 2)` % con la prior histórica.
+2. Responde la pregunta correcta para una elección *a posteriori*: no "¿es Usme distinta de Bogotá?", sino **¿cuál es la probabilidad de que Usme sea la localidad más mortal?**, que aquí es `r round(comp$P_es_la_mayor[comp$localidad == "Usme"], 2)`.
+
+Aun con el encogimiento, `P(p > p₀ | datos)` para Usme sigue siendo prácticamente 1: **la conclusión de que Usme es más mortal que la ciudad se mantiene**. Lo que cambia es la magnitud, que baja un poco (de `r round(100 * comp$crudo[comp$localidad == "Usme"], 2)` % a `r round(100 * comp$jerarquico[comp$localidad == "Usme"], 2)` %), y que hay que declarar que fue elegida por ser la mayor.
+
+# Resumen de supuestos
+
+| Supuesto | Herramienta | Bogotá | Usme | Kennedy |
+|---|---|---|---|---|
+| Dos resultados | Naturaleza de la variable | Cumple | Cumple | Cumple |
+| Número fijo de ensayos | Se condiciona en n · grupos de 50 | Cumple | Cumple | Cumple |
+| Independencia | Prueba de rachas | Cumple (p = 0,25) | Cumple (p = 0,53) | Cumple (p = 0,89) |
+| Probabilidad constante 2018–2020 | χ² de homogeneidad | Cumple (p = 0,35) | Cumple (p = 0,74) | Cumple (p = 0,28) |
+| Forma binomial | χ² de bondad de ajuste | Cumple (p = 0,44) | Cumple (p = 0,66) | Cumple (p = 0,42) |
+| Sin sobredispersión | Varianza observada / binomial | Cumple (1,05) | Cumple (0,73) | Cumple (1,15; leve) |
+| Conteo diario Poisson | χ² de bondad de ajuste | Cumple (p = 0,81) | — | — |
+
+Lo que no se cumple, y por eso cambia el diseño: la probabilidad no es constante entre 2015 y 2020
+(`p = 0,003`), ni entre la cuarentena y el periodo normal (`p = 0,001`), ni entre localidades
+(`p < 0,0001`).
+
+**Una advertencia sobre las pruebas:** En todas la hipótesis nula es que el supuesto se cumple, así
+que un valor p alto significa que los datos son compatibles con él, no que el modelo sea exactamente
+cierto. Los resultados que dependen de simulación (200.000 extracciones) pueden variar en la tercera
+cifra decimal.
+
+# Resultados clave y limitaciones
+
+- **Pregunta principal.** Usme tiene una probabilidad de siniestro con muertos de `r round(100 * (aH + yU) / (aH + bH + nU), 2)` % (IC 95 %: `r round(100 * qbeta(0.025, aH + yU, bH + nU - yU), 2)`–`r round(100 * qbeta(0.975, aH + yU, bH + nU - yU), 2)` %) frente a `r round(100 * p0, 2)` % en Bogotá: $P(p > p_0 \mid \text{datos}) \approx 1$, fuera del ROPE. Kennedy (`r round(100 * (aH + yK) / (aH + bH + nK), 2)` %) es compatible con la ciudad.
+- **No es un artefacto de la prior ni de la elección.** Cambia poco con cuatro priors, el $BF_{01}$ de Usme está por debajo de 1 con cualquier peso de prior (Lindley solo infla a Kennedy), y el modelo jerárquico (que corrige haber escogido la localidad más extrema) da `r round(100 * comp$jerarquico[comp$localidad == "Usme"], 2)` % con $P(p>p_0)$ prácticamente 1.
+- **Cuarentena.** Los siniestros fueron menos pero más mortales (razón ≈ 1,36), y el modelo ajustado con 2018–2019 no pudo predecirlo (127 observados frente a [74; 113]).
+- **JAGS.** Reproduce las posteriores analíticas (Beta–Binomial y Gamma–Poisson) con $\hat R \approx 1$, y permite el modelo jerárquico, que no tiene forma cerrada.
+- **Pérdidas.** Cada estimador es óptimo bajo su pérdida; cuanto más incierta la posterior (La Candelaria), más se separan los cinco estimadores.
+
+**Limitaciones.** (1) $p$ es una *proporción* de siniestros con muertos: no mide riesgo por habitante ni por kilómetro recorrido. (2) Los siniestros con solo daños se subregistran más que los fatales, lo que puede inflar $p$ en algunas localidades. (3) La localidad es la del lugar del siniestro, no la de residencia de las víctimas. (4) En la cuarentena no solo cambió el tráfico, también los horarios y el tipo de vehículos. (5) Kennedy muestra una leve sobredispersión, y el conteo diario tiene efecto del día de la semana y un día extremo que la Poisson no explica. (6) Usme se eligió después de ver los datos; el modelo jerárquico y la probabilidad de ser la mayor lo reconocen. (7) El ancho del ROPE y las constantes de las funciones de pérdida son supuestos de quien analiza.
