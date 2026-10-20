@@ -19,6 +19,20 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 options(OutDec = ",")   # coma decimal en todo el informe
 ```
 
+# Notación y términos
+
+Para que conteos, proporciones y parámetros no se mezclen en el informe:
+
+| Símbolo | Qué es | Cómo se llama aquí |
+|---|---|---|
+| $y,\ n$ | siniestros **con muertos** y siniestros totales de una localidad y periodo | conteos |
+| $p$ | probabilidad de que **un siniestro deje al menos un muerto** | *probabilidad* (o proporción) de siniestro con muertos; **no** es una tasa por habitante |
+| $p_0$ | proporción observada en Bogotá en el periodo reciente (2018–2020 sin cuarentena), 1,40 % | referencia de la ciudad |
+| $\lambda$ | siniestros con muertos **por día** | *tasa* diaria |
+| $a, b$ | parámetros de la Beta ($a+b$ = siniestros "imaginarios") | prior / posterior |
+
+El dataset cuenta dos unidades distintas: **2.995 siniestros con muertos** y **3.074 personas fallecidas** (un siniestro puede dejar más de un muerto). Todo el modelo usa la primera.
+
 # Librerías
 
 ```{r}
@@ -406,6 +420,62 @@ c(prob_usme_mayor = mean(sU > sR), dif_media = mean(sU - sR), quantile(sU - sR, 
 En Usme un siniestro deja muertos 1,8 puntos porcentuales más que en el resto de la ciudad (entre 1,1
 y 2,6). Dicho como razón: es 2,3 veces más mortal (entre 1,8 y 2,9).
 
+## Todas las localidades contra el resto de la ciudad (contrastes bayesianos completos)
+
+Comparar cada localidad con $p_0$ tratándolo como un número fijo es una simplificación: $p_0$ es también una **estimación** (y además *incluye* a la propia localidad). Un contraste bayesiano completo compara dos **parámetros inciertos**: la probabilidad de la localidad $j$ frente a la del **resto de la ciudad**, $p_{\text{resto},j}$, con la distribución conjunta de ambos (se simulan las dos posteriores, que son independientes porque usan datos distintos):
+
+$$\Delta_j = p_j - p_{\text{resto},j}, \qquad R_j = \frac{p_j}{p_{\text{resto},j}}, \qquad P(p_j > p_{\text{resto},j}\mid\text{datos}).$$
+
+Para $p_j$ se usa la prior histórica (la principal) y para $p_{\text{resto},j}$ una Beta(1, 1) (el resto tiene decenas de miles de siniestros, la prior no pesa). Se clasifica la localidad como **por encima** si $P(\Delta_j>0)>0{,}975$, **por debajo** si $<0{,}025$ y **compatible** en otro caso (equivale a que el intervalo de credibilidad central del 95 % de $\Delta_j$ excluya el cero).
+
+```{r contrastes-resto}
+set.seed(2026)
+NS <- 100000
+tot_y <- sum(rec$y); tot_n <- nrow(rec)
+contr <- do.call(rbind, lapply(seq_len(nrow(tab)), function(i) {
+  yj <- tab$y[i]; nj <- tab$n[i]
+  sj <- rbeta(NS, aH + yj, bH + nj - yj)
+  sr <- rbeta(NS, 1 + tot_y - yj, 1 + (tot_n - nj) - (tot_y - yj))
+  d <- sj - sr; r <- sj / sr
+  data.frame(localidad = tab$localidad[i], n = nj, y = yj,
+             p_j = mean(sj), p_resto = mean(sr),
+             dif_pp = 100 * mean(d), dif_li = 100 * quantile(d, 0.025), dif_ls = 100 * quantile(d, 0.975),
+             razon = mean(r), raz_li = quantile(r, 0.025), raz_ls = quantile(r, 0.975),
+             P_mayor_resto = mean(d > 0))
+})) %>%
+  mutate(veredicto = ifelse(P_mayor_resto > 0.975, "por encima", ifelse(P_mayor_resto < 0.025, "por debajo", "compatible"))) %>%
+  arrange(desc(P_mayor_resto))
+rownames(contr) <- NULL
+contr %>% mutate(across(c(p_j, p_resto), ~ round(100 * .x, 2)), across(c(dif_pp, dif_li, dif_ls, razon, raz_li, raz_ls), ~ round(.x, 2)),
+                 P_mayor_resto = round(P_mayor_resto, 3))
+```
+
+```{r contrastes-grafico, fig.width=8, fig.height=5.5}
+ggplot(contr %>% filter(localidad != "Sumapaz"),
+       aes(dif_pp, reorder(localidad, dif_pp), colour = veredicto)) +
+  geom_vline(xintercept = 0, linetype = "dotted") +
+  geom_errorbarh(aes(xmin = dif_li, xmax = dif_ls), height = 0) + geom_point(size = 2) +
+  scale_colour_manual(values = c("por encima" = "#eb6834", compatible = "gray55", "por debajo" = "#2a78d6"), name = NULL) +
+  labs(x = "Diferencia con el resto de la ciudad (puntos porcentuales, IC 95 %)", y = NULL) + theme_minimal()
+```
+
+Este contraste usa la incertidumbre de **ambos** lados y no depende de fijar $p_0$. Con el criterio del 95 % central coincide con la clasificación anterior: **tres por encima** (`r paste(contr$localidad[contr$veredicto == "por encima"], collapse = ", ")`) y **cuatro por debajo** (`r paste(contr$localidad[contr$veredicto == "por debajo"], collapse = ", ")`). Pero hay **dos casos de frontera**: Tunjuelito (`r round(contr$P_mayor_resto[contr$localidad == "Tunjuelito"], 3)`) y Bosa (`r round(contr$P_mayor_resto[contr$localidad == "Bosa"], 3)`) quedan apenas por debajo de 0,975. Si se usara un criterio unilateral de 0,95 (equivalente a un intervalo del 90 %) serían "por encima". **La clasificación de esas dos depende del umbral elegido**, y por eso se reporta la probabilidad y no solo el veredicto. Sumapaz (6 siniestros) es compatible por falta de datos, no porque se parezca a la ciudad.
+
+## Comparaciones directas entre localidades
+
+Para preguntas como "¿Usme es más mortal que Ciudad Bolívar?" el contraste se hace **entre las dos posteriores** (prior histórica, simulación conjunta):
+
+```{r contrastes-pares}
+cand <- c("Usme", "Ciudad Bolívar", "Rafael Uribe Uribe", "Tunjuelito", "Kennedy", "Usaquén")
+muestras <- lapply(cand, function(nm) { r <- tab[tab$localidad == nm, ]; rbeta(NS, aH + r$y, bH + r$n - r$y) })
+names(muestras) <- cand
+Pm <- outer(cand, cand, Vectorize(function(a, b) if (a == b) NA else mean(muestras[[a]] > muestras[[b]])))
+dimnames(Pm) <- list(`fila: ¿es mayor que...` = cand, `columna` = cand)
+round(Pm, 3)
+```
+
+Cada celda es $P(p_{\text{fila}} > p_{\text{columna}}\mid\text{datos})$. Por ejemplo, la probabilidad de que Usme sea más mortal que Ciudad Bolívar es `r round(Pm["Usme", "Ciudad Bolívar"], 2)`: es probable pero **no concluyente**, a diferencia de Usme frente a Kennedy (`r round(Pm["Usme", "Kennedy"], 3)`). Entre Kennedy y Usaquén la probabilidad de que Kennedy sea mayor es `r round(Pm["Kennedy", "Usaquén"], 3)`.
+
 # La cuarentena de 2020
 
 ```{r}
@@ -629,19 +699,27 @@ hpd <- function(qf, mass = 0.95) {
 casos <- list(
   p_usme       = function(q) qbeta(q, aH + yU, bH + nU - yU),
   p_cuarentena = function(q) qbeta(q, aC, bC),
-  p_candelaria = function(q) qbeta(q, 1 + 5, 1 + 402),
-  p_sumapaz    = function(q) qbeta(q, 1 + 3, 1 + 3),
+  p_candelaria_hist = function(q) qbeta(q, aH + 5, bH + 402),     # prior histórica (la principal)
+  p_candelaria_unif = function(q) qbeta(q, 1 + 5, 1 + 402),       # uniforme (solo para ver la asimetría)
+  p_sumapaz_hist    = function(q) qbeta(q, aH + 3, bH + 3),
+  p_sumapaz_unif    = function(q) qbeta(q, 1 + 3, 1 + 3),
   l_normal     = function(q) qgamma(q, GN[1], GN[2]),
   l_cuarentena = function(q) qgamma(q, GC[1], GC[2]),
   l_usme       = function(q) qgamma(q, GU[1], GU[2]))
-t(sapply(casos, function(qf) { h <- hpd(qf); ci <- qf(c(0.025, 0.975))
+hpd_tab <- t(sapply(casos, function(qf) { h <- hpd(qf); ci <- qf(c(0.025, 0.975))
   c(ci_li = ci[1], ci_ls = ci[2], h, reduccion_pct = 100 * (1 - diff(h) / diff(ci))) }))
+hpd_tab
 ```
 
 Con posteriores casi simétricas (Usme, Bogotá, λ) los dos intervalos prácticamente coinciden: el HPD es
-menos del 0,4 % más angosto. Donde se nota es en La Candelaria (5 de 407): la posterior es asimétrica y
-el HPD es 3,7 % más angosto y se corre hacia la izquierda ([0,43 %; 2,65 %] frente a [0,54 %; 2,84 %]).
-En Sumapaz la posterior Beta(4, 4) es simétrica y los dos coinciden exactamente.
+menos del 0,4 % más angosto. La ventaja del HPD aparece donde hay **pocos datos**, porque la posterior queda asimétrica: con la **prior
+histórica** (la que usa el resto del informe) es de `r round(hpd_tab["p_candelaria_hist", "reduccion_pct.hpd_ls"], 1)` % en La Candelaria (5 de 407) y de
+`r round(hpd_tab["p_sumapaz_hist", "reduccion_pct.hpd_ls"], 1)` % en Sumapaz; con la **uniforme**, en La Candelaria sube a
+`r round(hpd_tab["p_candelaria_unif", "reduccion_pct.hpd_ls"], 1)` % y el HPD se corre hacia la izquierda
+([`r round(100 * hpd_tab["p_candelaria_unif", "hpd_li"], 2)` %; `r round(100 * hpd_tab["p_candelaria_unif", "hpd_ls"], 2)` %] frente a
+[`r round(100 * hpd_tab["p_candelaria_unif", "ci_li"], 2)` %; `r round(100 * hpd_tab["p_candelaria_unif", "ci_ls"], 2)` %]). En Sumapaz con la
+uniforme la posterior Beta(4, 4) es simétrica y los dos intervalos coinciden exactamente. *(Se indica la prior de cada fila porque en
+versiones anteriores se mezclaban la uniforme y la histórica entre tablas.)*
 
 # Teoría de la decisión: cinco funciones de pérdida
 
@@ -718,6 +796,45 @@ tab %>% mutate(p_alto = 1 - pbeta(1.5 * p0, a, b), intervenir = p_alto > C1 / (C
 
 Se intervienen Usme (0,999), Ciudad Bolívar (0,98) y Rafael Uribe Uribe (0,77). Sumapaz también
 pasa el umbral (0,68), pero con solo 6 siniestros esa decisión la toma casi entera la prior.
+
+### La decisión con riesgo y pérdida explícitos
+
+Lo anterior fija un umbral de "alto riesgo" sin justificarlo. Aquí se hace explícito:
+
+**Riesgo.** Se define el riesgo de una localidad como su **exceso de letalidad sobre la ciudad**: $p_j - p_0$. Una localidad es de **alto riesgo** si $p_j > p^* = k\,p_0$. Se toma $k = 1{,}5$ (un siniestro al menos 50 % más mortal que el promedio, es decir $p^* = 2{,}10\,\%$); es un supuesto del decisor y por eso se prueba con otros valores.
+
+**Decisión y pérdida.** El decisor elige entre *intervenir* ($a_1$) y *no intervenir* ($a_0$), con pérdida
+
+| | $p_j \le p^*$ (no es de alto riesgo) | $p_j > p^*$ (alto riesgo) |
+|---|---|---|
+| Intervenir ($a_1$) | $c_1$ (intervención innecesaria) | 0 |
+| No intervenir ($a_0$) | 0 | $c_2$ (omisión: muertes evitables) |
+
+La pérdida esperada posterior es $E[L(a_1)] = c_1\,P(p_j\le p^*\mid\text{datos})$ y $E[L(a_0)] = c_2\,P(p_j>p^*\mid\text{datos})$, así que **se interviene si $P(p_j>p^*\mid\text{datos}) > c_1/(c_1+c_2)$**. Con $c_1 = 1$ y $c_2 = 3$ (omitir cuesta el triple, porque cada siniestro con muertos es irreversible) el umbral es 0,25.
+
+Como la decisión depende de $k$ y de $c_2/c_1$, se reporta cuántas localidades se intervienen en una **rejilla de supuestos**, y también el **exceso esperado de letalidad** $E[(p_j-p_0)^+]$, que no depende de ningún umbral y sirve para ordenar:
+
+```{r decision-explicita}
+dec <- tab %>% rowwise() %>%
+  mutate(exceso_pp = 100 * integrate(function(t) pmax(t - p0, 0) * dbeta(t, a, b), 0.001, 0.12, subdivisions = 400)$value) %>%
+  ungroup() %>% select(localidad, n, y, media, exceso_pp, a, b)
+rej <- expand.grid(k = c(1.25, 1.5, 2), c2c1 = c(2, 3, 5))
+res <- do.call(rbind, lapply(seq_len(nrow(rej)), function(i) {
+  um <- 1 / (1 + rej$c2c1[i])                                  # c1/(c1+c2) con c1 = 1
+  interv <- dec$localidad[(1 - pbeta(rej$k[i] * p0, dec$a, dec$b)) > um]
+  data.frame(k = rej$k[i], p_estrella = round(100 * rej$k[i] * p0, 2), c2_sobre_c1 = rej$c2c1[i], umbral = round(um, 2),
+             n_intervenidas = length(interv), intervenidas = paste(interv, collapse = ", "))
+}))
+res
+dec %>% mutate(p_alto = 1 - pbeta(1.5 * p0, a, b), media = round(100 * media, 2), exceso_pp = round(exceso_pp, 3), p_alto = round(p_alto, 3)) %>%
+  select(localidad, n, y, media, exceso_pp, p_alto) %>% arrange(desc(exceso_pp)) %>% head(8)
+```
+
+```{r decision-conteos, include=FALSE}
+veces <- sapply(c("Usme", "Ciudad Bolívar", "Rafael Uribe Uribe", "Sumapaz"), function(nm) sum(grepl(nm, res$intervenidas)))
+```
+
+**Lectura.** De los `r nrow(res)` escenarios, **Usme** se interviene en `r veces["Usme"]`, **Ciudad Bolívar** en `r veces["Ciudad Bolívar"]` y **Rafael Uribe Uribe** en `r veces["Rafael Uribe Uribe"]` (siempre que el umbral de riesgo sea $k \le 1{,}5$); las demás localidades entran solo con umbrales de riesgo bajos o costos de omisión altos. La lista de localidades intervenidas **no es un resultado de los datos solos**: es el resultado de los datos *y* de la función de pérdida, y por eso se muestra cómo cambia. Sumapaz (6 siniestros) entra en `r veces["Sumapaz"]` escenarios y siempre por efecto de la prior, no de evidencia propia: la decisión debería confirmarse con más datos.
 
 # Verificación con JAGS
 
