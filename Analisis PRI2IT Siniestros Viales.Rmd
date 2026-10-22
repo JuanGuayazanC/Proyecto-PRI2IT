@@ -19,6 +19,33 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 options(OutDec = ",")   # coma decimal en todo el informe
 ```
 
+# Objetivos e hipótesis
+
+## Objetivo general
+
+**Estimar**, con modelos bayesianos Beta–Binomial y Gamma–Poisson, la probabilidad de que un siniestro vial deje al menos un muerto en cada localidad de Bogotá D.C. entre 2018 y 2020, y **comparar** la letalidad de Usme, la localidad con mayor probabilidad observada, con la del resto de la ciudad en periodo normal y durante la cuarentena de 2020.
+
+## Objetivos específicos
+
+1. **Estimar** la probabilidad $p$ de siniestro con muertos en cada localidad, con su intervalo de credibilidad, a partir de una prior construida con la historia de la ciudad (2015–2017).
+2. **Comparar** la letalidad de cada localidad con la del resto de Bogotá mediante contrastes bayesianos, e identificar cuáles quedan por encima, por debajo o compatibles con la ciudad.
+3. **Analizar** si los siniestros con muertos siguen una distribución Binomial (y los conteos diarios una Poisson) mediante pruebas de bondad de ajuste, y qué implica el resultado para el diseño del modelo.
+4. **Comparar** la letalidad de la cuarentena de 2020 con la del periodo normal, y **evaluar** si un modelo ajustado con 2018–2019 predice cada periodo.
+5. **Analizar** qué tanto dependen las conclusiones de la prior elegida (histórica, Jeffreys, uniforme y escéptica).
+6. **Estimar**, con funciones de pérdida explícitas, qué localidades conviene intervenir primero y qué tan robusta es esa decisión.
+7. **Contrastar** los resultados analíticos con simulación MCMC en JAGS y **extenderlos** a un modelo jerárquico que corrija haber elegido la localidad más extrema.
+
+## Hipótesis del proyecto
+
+Cada hipótesis dice **qué se espera y con qué magnitud**; no es una prueba de hipótesis. Se contrastan con los resultados en la sección "Contraste de las hipótesis".
+
+| | Hipótesis | Magnitud esperada |
+|---|---|---|
+| **H1** | La probabilidad de siniestro con muertos en **Usme** supera a la del resto de la ciudad. | Al menos **1 punto porcentual** más, con probabilidad posterior mayor a 0,95. |
+| **H2** | En la **cuarentena** de 2020 los siniestros fueron más mortales que en periodo normal. | Razón de probabilidades de al menos **1,25**, con probabilidad posterior mayor a 0,95. |
+| **H3** | La conclusión sobre Usme **no depende de la prior** elegida. | $P(p>p_0\mid\text{datos}) > 0{,}99$ con las cuatro priors. |
+| **H4** | Un modelo ajustado con 2018–2019 **predice** los siniestros con muertos de 2020 sin cuarentena. | El valor observado cae dentro del intervalo predictivo del 95 % en Bogotá, Usme y Kennedy. |
+
 # Notación y términos
 
 Para que conteos, proporciones y parámetros no se mezclen en el informe:
@@ -300,6 +327,9 @@ c(media = m_h, peso = peso, a = aH, b = bH, li = qbeta(0.025, aH, bH), ls = qbet
 
 La prior es Beta(4,60; 281,29): media 1,61 %, pesa como 286 siniestros y dice que la tasa de una
 localidad cualquiera está, con 95 % de probabilidad, entre 0,50 % y 3,36 %.
+
+**Fuente de la información previa.** La prior sale de los siniestros viales registrados por la Secretaría Distrital de Movilidad entre el 1 de enero de 2015 y el 31 de diciembre de 2017: **101.500 siniestros, 1.634 con al menos un muerto** (1,61 %), en 19 localidades (sin Sumapaz) (Secretaría Distrital de Movilidad, 2021). Se construye con el método de los momentos sobre las tasas de las 19 localidades, descontando la varianza que es solo azar binomial, siguiendo la idea de los modelos jerárquicos con Beta–Binomial (Gelman et al., 2013, cap. 5). Esos datos **no se reutilizan** en la verosimilitud (2018–2020), de modo que la información previa y los datos son independientes.
+
 
 # MODELO · Beta–Binomial por localidad
 
@@ -991,3 +1021,58 @@ cifra decimal.
 - **Pérdidas.** Cada estimador es óptimo bajo su pérdida; cuanto más incierta la posterior (La Candelaria), más se separan los cinco estimadores.
 
 **Limitaciones.** (1) $p$ es una *proporción* de siniestros con muertos: no mide riesgo por habitante ni por kilómetro recorrido. (2) Los siniestros con solo daños se subregistran más que los fatales, lo que puede inflar $p$ en algunas localidades. (3) La localidad es la del lugar del siniestro, no la de residencia de las víctimas. (4) En la cuarentena no solo cambió el tráfico, también los horarios y el tipo de vehículos. (5) Kennedy muestra una leve sobredispersión, y el conteo diario tiene efecto del día de la semana y un día extremo que la Poisson no explica. (6) Usme se eligió después de ver los datos; el modelo jerárquico y la probabilidad de ser la mayor lo reconocen. (7) El ancho del ROPE y las constantes de las funciones de pérdida son supuestos de quien analiza.
+
+# Contraste de las hipótesis
+
+```{r contraste-hipotesis}
+# H1: Usme supera al resto de la ciudad en al menos 1 pp (sU, sR vienen de "Usme contra el resto")
+P_H1 <- mean(sU - sR > 0.01)
+# H2: razón de probabilidades cuarentena / normal de al menos 1,25 (sC, sN vienen de "La cuarentena de 2020")
+P_H2 <- mean(sC / sN > 1.25)
+# H3: P(p > p0 | datos) de Usme bajo las cuatro priors
+P_H3 <- sens_loc(5)[, "p_mayor_p0"]
+# H4: el observado cae dentro del intervalo predictivo 95 % (modelo ajustado con 2018-2019)
+ent_ <- rec %>% filter(anio <= 2019)
+v4 <- rbind(Bogota  = valida(ent_, rec %>% filter(anio == 2020)),
+            Usme    = valida(ent_ %>% filter(CODIGO_LOCALIDAD == 5), rec %>% filter(anio == 2020, CODIGO_LOCALIDAD == 5), aH, bH),
+            Kennedy = valida(ent_ %>% filter(CODIGO_LOCALIDAD == 8), rec %>% filter(anio == 2020, CODIGO_LOCALIDAD == 8), aH, bH))
+dentro4 <- v4[, "observado"] >= v4[, "li"] & v4[, "observado"] <= v4[, "ls"]
+hip <- data.frame(
+  hipotesis = c("H1: Usme supera al resto en >= 1 pp", "H2: razon cuarentena/normal >= 1,25",
+                "H3: P(p > p0) > 0,99 con las 4 priors", "H4: observado 2020 dentro del IC 95 % predictivo"),
+  resultado = c(paste0("P = ", format(round(P_H1, 3), nsmall = 3)), paste0("P = ", format(round(P_H2, 3), nsmall = 3)),
+                paste0("minimo = ", format(min(P_H3), digits = 7)), sprintf("%d de %d dentro", sum(dentro4), length(dentro4))),
+  se_cumple = c(P_H1 > 0.95, P_H2 > 0.95, all(P_H3 > 0.99), all(dentro4)))
+hip
+```
+
+- **H1** (`r ifelse(P_H1 > 0.95, "se cumple", "no se cumple")`): la probabilidad posterior de que Usme supere al resto en al menos 1 pp es `r round(P_H1, 3)`. La diferencia estimada es de `r round(100 * mean(sU - sR), 2)` pp.
+- **H2** (`r ifelse(P_H2 > 0.95, "se cumple", "no se cumple")`): la probabilidad de que la cuarentena fuera al menos 1,25 veces más mortal es `r round(P_H2, 3)`. La razón estimada es `r round(mean(sC / sN), 2)` (IC 95 %: `r round(quantile(sC / sN, 0.025), 2)`–`r round(quantile(sC / sN, 0.975), 2)`) y la probabilidad de que la cuarentena fuera *más* mortal que el periodo normal, sin exigir magnitud, es `r round(mean(sC > sN), 3)`. Es decir, hay evidencia clara de que fue más mortal, pero **no con la certeza exigida para una razón de 1,25**. Se reporta como hipótesis no cumplida: es un resultado válido, que además indica que la magnitud real del efecto es incierta.
+- **H3** (`r ifelse(all(P_H3 > 0.99), "se cumple", "no se cumple")`): con las cuatro priors, $P(p>p_0\mid\text{datos})$ es siempre mayor a `r format(min(P_H3), digits = 6)`.
+- **H4** (`r ifelse(all(dentro4), "se cumple", "no se cumple")`): el modelo ajustado con 2018–2019 predice dentro del intervalo del 95 % `r sum(dentro4)` de las `r length(dentro4)` series (Bogotá, Usme y Kennedy). La **cuarentena**, en cambio, queda fuera: no se parece a lo que el modelo con periodo normal predice.
+
+# Bibliografía
+
+Berger, J. O. (1985). *Statistical decision theory and Bayesian analysis* (2.ª ed.). Springer.
+
+Correa Morales, J. C., y Barrera Causil, C. J. (2018). *Introducción a la estadística bayesiana*. Fondo Editorial ITM.
+
+Gelman, A., Carlin, J. B., Stern, H. S., Dunson, D. B., Vehtari, A., y Rubin, D. B. (2013). *Bayesian data analysis* (3.ª ed.). CRC Press.
+
+Gelman, A., y Rubin, D. B. (1992). Inference from iterative simulation using multiple sequences. *Statistical Science, 7*(4), 457–472.
+
+Hoff, P. D. (2009). *A first course in Bayesian statistical methods*. Springer.
+
+Kass, R. E., y Raftery, A. E. (1995). Bayes factors. *Journal of the American Statistical Association, 90*(430), 773–795.
+
+Kruschke, J. K. (2018). Rejecting or accepting parameter values in Bayesian estimation. *Advances in Methods and Practices in Psychological Science, 1*(2), 270–280.
+
+Plummer, M. (2003). JAGS: A program for analysis of Bayesian graphical models using Gibbs sampling. En *Proceedings of the 3rd International Workshop on Distributed Statistical Computing*.
+
+R Core Team. (2025). *R: A language and environment for statistical computing* (versión 4.4.3). R Foundation for Statistical Computing.
+
+Secretaría Distrital de Movilidad. (2021). *Siniestros viales consolidados Bogotá D.C.* [Conjunto de datos]. Datos Abiertos Bogotá. https://datosabiertos.bogota.gov.co/dataset/siniestros-viales-consolidados-bogota-d-c
+
+Wald, A., y Wolfowitz, J. (1940). On a test whether two samples are from the same population. *The Annals of Mathematical Statistics, 11*(2), 147–162.
+
+Zellner, A. (1986). Bayesian estimation and prediction using asymmetric loss functions. *Journal of the American Statistical Association, 81*(394), 446–451.
